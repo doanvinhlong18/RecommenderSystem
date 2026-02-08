@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anime Recommendation System - Web Demo</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>A</text></svg>">
+</head>
+<body>
+    <div id="app">
+        <!-- Navigation -->
+        <nav class="navbar">
+            <div class="nav-brand">
+                <span class="nav-logo">A</span>
+                <span class="nav-title">Anime Recommender</span>
+            </div>
+            <div class="nav-links">
+                <a href="#" class="nav-link active" data-page="home">
+                    <span class="nav-icon"></span> Search
+                </a>
+                <a href="#" class="nav-link" data-page="popular">
+                    <span class="nav-icon"></span> Popular
+                </a>
+                <a href="#" class="nav-link" data-page="user">
+                    <span class="nav-icon"></span> For You
+                </a>
+                <a href="#" class="nav-link" data-page="compare">
+                    <span class="nav-icon"></span> Compare
+                </a>
+            </div>
+            <div class="nav-status" id="apiStatus">
+                <span class="status-dot"></span>
+                <span class="status-text">Connecting...</span>
+            </div>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Home Page - Search -->
+            <section class="page active" id="page-home">
+                <div class="page-header">
+                    <h1>Find Similar Anime</h1>
+                    <p>Search for an anime and discover similar titles using our hybrid recommendation engine</p>
+                </div>
+
+                <!-- Search Section -->
+                <div class="search-section">
+                    <div class="search-wrapper">
+                        <input
+                            type="text"
+                            class="search-input"
+                            id="searchInput"
+                            placeholder="Search anime by name (e.g., Naruto, Death Note, Attack on Titan)..."
+                            autocomplete="off"
+                        >
+                        <button class="search-btn" id="searchBtn">
+                            <span>Search</span>
+                        </button>
+                        <div class="autocomplete-dropdown" id="autocompleteDropdown"></div>
+                    </div>
+
+                    <!-- Quick Tags -->
+                    <div class="quick-tags">
+                        <span class="quick-tag" data-anime="Naruto">Naruto</span>
+                        <span class="quick-tag" data-anime="Death Note">Death Note</span>
+                        <span class="quick-tag" data-anime="Attack on Titan">Attack on Titan</span>
+                        <span class="quick-tag" data-anime="One Piece">One Piece</span>
+                        <span class="quick-tag" data-anime="Demon Slayer">Demon Slayer</span>
+                        <span class="quick-tag" data-anime="Fullmetal Alchemist">FMA</span>
+                    </div>
+                </div>
+
+                <!-- Selected Anime Detail -->
+                <div class="anime-detail-card hidden" id="selectedAnimeCard">
+                    <div class="detail-header">
+                        <h2>Selected Anime</h2>
+                    </div>
+                    <div class="detail-content">
+                        <div class="detail-image">
+                            <img id="selectedAnimeImage" src="" alt="Anime poster">
+                        </div>
+                        <div class="detail-info">
+                            <h3 id="selectedAnimeName">-</h3>
+                            <p class="detail-english" id="selectedAnimeEnglish">-</p>
+                            <div class="detail-meta">
+                                <span class="meta-badge score" id="selectedAnimeScore">
+                                    <span class="badge-icon">Score:</span>
+                                    <span class="badge-value">-</span>
+                                </span>
+                                <span class="meta-badge type" id="selectedAnimeType">-</span>
+                            </div>
+                            <div class="detail-genres" id="selectedAnimeGenres">-</div>
+                            <p class="detail-synopsis" id="selectedAnimeSynopsis">-</p>
+                            <a href="#" target="_blank" class="mal-link" id="selectedAnimeMAL">
+                                View on MyAnimeList
+                            </a>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recommendation Controls -->
+                <div class="controls-section hidden" id="controlsSection">
+                    <div class="control-group">
+                        <label>Recommendation Method:</label>
+                        <div class="method-selector">
+                            <button class="method-btn" data-method="content" title="Content-Based (TF-IDF + SBERT)">
+                                Content
+                            </button>
+                            <button class="method-btn" data-method="collaborative" title="Collaborative Filtering">
+                                Collaborative
+                            </button>
+                            <button class="method-btn active" data-method="hybrid" title="Hybrid (Combined)">
+                                Hybrid
+                            </button>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <label>Results:</label>
+                        <input type="number" class="topk-input" id="topkInput" value="10" min="1" max="50">
+                    </div>
+                    <button class="recommend-btn" id="getRecommendationsBtn">
+                        Get Recommendations
+                    </button>
+                </div>
+
+                <!-- Recommendations Grid -->
+                <div class="recommendations-section hidden" id="recommendationsSection">
+                    <div class="section-header">
+                        <h2>Similar Anime Recommendations</h2>
+                        <span class="results-count" id="resultsCount">0 results</span>
+                    </div>
+                    <div class="anime-grid" id="recommendationsGrid"></div>
+                </div>
+            </section>
+
+            <!-- Anime Detail Page -->
+            <section class="page" id="page-detail">
+                <button class="back-btn" id="backToSearchBtn">
+                    ← Back to Search
+                </button>
+                <div class="detail-page-content" id="detailPageContent">
+                    <!-- Content loaded dynamically -->
+                </div>
+            </section>
+
+            <!-- Popular Page -->
+            <section class="page" id="page-popular">
+                <div class="page-header">
+                    <h1>Popular & Trending Anime</h1>
+                    <p>Discover the most popular and highest rated anime</p>
+                </div>
+
+                <!-- Popular Type Selector -->
+                <div class="popular-tabs">
+                    <button class="popular-tab active" data-type="top_rated">
+                        Top Rated
+                    </button>
+                    <button class="popular-tab" data-type="most_members">
+                        Most Members
+                    </button>
+                    <button class="popular-tab" data-type="trending">
+                        Trending
+                    </button>
+                </div>
+
+                <!-- Genre Filter -->
+                <div class="genre-filter">
+                    <label>Filter by Genre:</label>
+                    <select id="genreFilter" class="genre-select">
+                        <option value="">All Genres</option>
+                    </select>
+                </div>
+
+                <!-- Popular Grid -->
+                <div class="anime-grid" id="popularGrid">
+                    <div class="loading-spinner">
+                        <div class="spinner"></div>
+                        <p>Loading popular anime...</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- User Recommendations Page -->
+            <section class="page" id="page-user">
+                <div class="page-header">
+                    <h1>Personalized Recommendations</h1>
+                    <p>Get anime recommendations tailored to your preferences</p>
+                </div>
+
+                <!-- User Input -->
+                <div class="user-input-section">
+                    <div class="user-input-card">
+                        <h3>Enter Your User ID</h3>
+                        <p class="input-hint">Enter a numeric user ID to get personalized recommendations</p>
+                        <div class="user-input-wrapper">
+                            <input
+                                type="number"
+                                class="user-id-input"
+                                id="userIdInput"
+                                placeholder="e.g., 12345"
+                                min="1"
+                            >
+                            <button class="get-user-recs-btn" id="getUserRecsBtn">
+                                Get Recommendations
+                            </button>
+                        </div>
+                        <!-- Demo User IDs -->
+                        <div class="demo-users">
+                            <span class="demo-label">Try demo users:</span>
+                            <button class="demo-user-btn" data-user="1">User 1</button>
+                            <button class="demo-user-btn" data-user="100">User 100</button>
+                            <button class="demo-user-btn" data-user="999999">New User (Cold Start)</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- User Strategy Info -->
+                <div class="user-strategy-info hidden" id="userStrategyInfo">
+                    <div class="strategy-badge" id="strategyBadge">
+                        <span class="strategy-icon"></span>
+                        <span class="strategy-text">Strategy: Auto</span>
+                    </div>
+                    <p class="cold-start-notice hidden" id="coldStartNotice">
+                        This is a new user. Using popularity-based recommendations.
+                    </p>
+                </div>
+
+                <!-- User Recommendations Grid -->
+                <div class="anime-grid" id="userRecsGrid"></div>
+            </section>
+
+            <!-- Compare Methods Page -->
+            <section class="page" id="page-compare">
+                <div class="page-header">
+                    <h1>Compare Recommendation Methods</h1>
+                    <p>See how different algorithms produce different recommendations</p>
+                </div>
+
+                <!-- Compare Input -->
+                <div class="compare-input-section">
+                    <div class="search-wrapper">
+                        <input
+                            type="text"
+                            class="search-input"
+                            id="compareSearchInput"
+                            placeholder="Search for an anime to compare..."
+                            autocomplete="off"
+                        >
+                        <button class="search-btn" id="compareSearchBtn">Compare</button>
+                        <div class="autocomplete-dropdown" id="compareAutocomplete"></div>
+                    </div>
+                </div>
+
+                <!-- Comparison Grid -->
+                <div class="comparison-grid hidden" id="comparisonGrid">
+                    <div class="comparison-column" id="contentColumn">
+                        <div class="column-header content-header">
+                            <h3>Content-Based</h3>
+                            <p>TF-IDF + SBERT similarity</p>
+                        </div>
+                        <div class="column-content" id="contentResults"></div>
+                    </div>
+                    <div class="comparison-column" id="collaborativeColumn">
+                        <div class="column-header collab-header">
+                            <h3>Collaborative</h3>
+                            <p>Item-item similarity</p>
+                        </div>
+                        <div class="column-content" id="collaborativeResults"></div>
+                    </div>
+                    <div class="comparison-column" id="hybridColumn">
+                        <div class="column-header hybrid-header">
+                            <h3>Hybrid</h3>
+                            <p>Combined approach</p>
+                        </div>
+                        <div class="column-content" id="hybridResults"></div>
+                    </div>
+                </div>
+
+                <!-- Weights Adjustment -->
+                <div class="weights-panel" id="weightsPanel">
+                    <h3>Adjust Hybrid Weights</h3>
+                    <div class="weights-grid">
+                        <div class="weight-slider">
+                            <label>Content</label>
+                            <input type="range" id="weightContent" min="0" max="100" value="30">
+                            <span class="weight-value" id="weightContentValue">0.30</span>
+                        </div>
+                        <div class="weight-slider">
+                            <label>Collaborative</label>
+                            <input type="range" id="weightCollaborative" min="0" max="100" value="40">
+                            <span class="weight-value" id="weightCollaborativeValue">0.40</span>
+                        </div>
+                        <div class="weight-slider">
+                            <label>Implicit</label>
+                            <input type="range" id="weightImplicit" min="0" max="100" value="20">
+                            <span class="weight-value" id="weightImplicitValue">0.20</span>
+                        </div>
+                        <div class="weight-slider">
+                            <label>Popularity</label>
+                            <input type="range" id="weightPopularity" min="0" max="100" value="10">
+                            <span class="weight-value" id="weightPopularityValue">0.10</span>
+                        </div>
+                    </div>
+                    <button class="apply-weights-btn" id="applyWeightsBtn">Apply Weights</button>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="footer-content">
+                <p>Hybrid Anime Recommendation System</p>
+                <p class="footer-tech">Powered by Content-Based, Collaborative Filtering, Implicit Feedback & SBERT</p>
+            </div>
+        </footer>
+
+        <!-- Toast Notification -->
+        <div class="toast hidden" id="toast">
+            <span class="toast-icon" id="toastIcon"></span>
+            <span class="toast-message" id="toastMessage"></span>
+        </div>
+
+        <!-- Loading Overlay -->
+        <div class="loading-overlay hidden" id="loadingOverlay">
+            <div class="loading-content">
+                <div class="spinner large"></div>
+                <p>Loading recommendations...</p>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

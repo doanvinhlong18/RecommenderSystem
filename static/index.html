@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anime Hybrid Recommender</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🎌</span>
+                <h1>Anime Hybrid Recommender</h1>
+            </div>
+            <p class="subtitle">TF-IDF + SBERT + Score Weighting</p>
+        </header>
+
+        <main class="main-content">
+            <!-- Left Panel: Search & Controls -->
+            <aside class="left-panel">
+                <!-- Search Section -->
+                <section class="card search-section">
+                    <h2 class="card-title">🔎 Search Anime</h2>
+                    <div class="search-container">
+                        <input
+                            type="text"
+                            id="searchInput"
+                            class="search-input"
+                            placeholder="Type anime name..."
+                            autocomplete="off"
+                        >
+                        <div id="searchDropdown" class="search-dropdown hidden"></div>
+                    </div>
+                    <button id="recommendBtn" class="btn btn-primary" disabled>
+                        <span class="btn-icon">✨</span>
+                        Get Recommendations
+                    </button>
+
+                    <!-- Quick Suggestions -->
+                    <div class="suggestions">
+                        <p class="suggestions-title">Try these:</p>
+                        <div class="suggestion-tags" id="suggestionTags">
+                            <span class="tag" data-anime="Sousou no Frieren">Frieren</span>
+                            <span class="tag" data-anime="Death Note">Death Note</span>
+                            <span class="tag" data-anime="Naruto">Naruto</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Weight Controls Section -->
+                <section class="card weights-section">
+                    <h2 class="card-title">🎚️ Hybrid Weights</h2>
+                    <p class="weights-info">Adjust component weights (must sum to 1.0)</p>
+
+                    <div class="weight-control">
+                        <div class="weight-header">
+                            <label for="alphaSlider">
+                                <span class="weight-icon">📝</span> TF-IDF (α)
+                            </label>
+                            <span class="weight-value" id="alphaValue">0.40</span>
+                        </div>
+                        <input
+                            type="range"
+                            id="alphaSlider"
+                            class="slider slider-tfidf"
+                            min="0" max="100" value="40"
+                        >
+                        <p class="weight-desc">Lexical/Keyword similarity</p>
+                    </div>
+
+                    <div class="weight-control">
+                        <div class="weight-header">
+                            <label for="betaSlider">
+                                <span class="weight-icon">🧠</span> SBERT (β)
+                            </label>
+                            <span class="weight-value" id="betaValue">0.40</span>
+                        </div>
+                        <input
+                            type="range"
+                            id="betaSlider"
+                            class="slider slider-sbert"
+                            min="0" max="100" value="40"
+                        >
+                        <p class="weight-desc">Semantic/Meaning similarity</p>
+                    </div>
+
+                    <div class="weight-control">
+                        <div class="weight-header">
+                            <label for="gammaSlider">
+                                <span class="weight-icon">⭐</span> Score (γ)
+                            </label>
+                            <span class="weight-value" id="gammaValue">0.20</span>
+                        </div>
+                        <input
+                            type="range"
+                            id="gammaSlider"
+                            class="slider slider-score"
+                            min="0" max="100" value="20"
+                        >
+                        <p class="weight-desc">Quality/Rating weighting</p>
+                    </div>
+
+                    <div class="weight-sum" id="weightSum">
+                        <span class="sum-label">Total:</span>
+                        <span class="sum-value valid">1.00</span>
+                    </div>
+
+                    <!-- Preset Configurations -->
+                    <div class="presets">
+                        <p class="presets-title">Presets:</p>
+                        <div class="preset-buttons">
+                            <button class="btn-preset" data-alpha="40" data-beta="40" data-gamma="20">Balanced</button>
+                            <button class="btn-preset" data-alpha="30" data-beta="50" data-gamma="20">Semantic</button>
+                            <button class="btn-preset" data-alpha="50" data-beta="30" data-gamma="20">Lexical</button>
+                            <button class="btn-preset" data-alpha="80" data-beta="10" data-gamma="10">TF-IDF Heavy</button>
+                        </div>
+                    </div>
+
+                    <!-- Top K Control -->
+                    <div class="topk-control">
+                        <label for="topkInput">Results (Top-K):</label>
+                        <input type="number" id="topkInput" class="topk-input" min="1" max="20" value="5">
+                    </div>
+                </section>
+
+                <!-- Metrics Panel -->
+                <section class="card metrics-section">
+                    <h2 class="card-title">📊 Model Evaluation</h2>
+                    <div class="metrics-grid" id="metricsGrid">
+                        <div class="metric-card">
+                            <span class="metric-value" id="precisionValue">--</span>
+                            <span class="metric-label">Precision@5</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-value" id="recallValue">--</span>
+                            <span class="metric-label">Recall@5</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-value" id="ndcgValue">--</span>
+                            <span class="metric-label">NDCG@5</span>
+                        </div>
+                        <div class="metric-card best-config">
+                            <span class="metric-value" id="bestConfigValue">--</span>
+                            <span class="metric-label">Best Config</span>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+
+            <!-- Right Panel: Results -->
+            <section class="right-panel">
+                <!-- Query Anime Card -->
+                <div class="card query-anime-card hidden" id="queryAnimeCard">
+                    <h2 class="card-title">🎬 Query Anime</h2>
+                    <div class="anime-info">
+                        <div class="anime-image-container">
+                            <img id="queryAnimeImage" class="anime-image" src="" alt="Anime cover" onerror="this.style.display='none'">
+                        </div>
+                        <div class="anime-details">
+                            <a href="#" id="queryAnimeLink" target="_blank" class="anime-name-link">
+                                <h3 class="anime-name" id="queryAnimeName">--</h3>
+                            </a>
+                            <div class="anime-meta">
+                                <span class="anime-score" id="queryAnimeScore">
+                                    <span class="score-icon">⭐</span>
+                                    <span class="score-value">--</span>
+                                </span>
+                                <span class="anime-type" id="queryAnimeType">--</span>
+                            </div>
+                            <div class="anime-themes" id="queryAnimeThemes">--</div>
+                            <a href="#" id="queryAnimeExternalLink" target="_blank" class="external-link hidden">
+                                🔗 View on MyAnimeList
+                            </a>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recommendations Table -->
+                <div class="card recommendations-card" id="recommendationsCard">
+                    <h2 class="card-title">⭐ Recommendations</h2>
+
+                    <!-- Loading State -->
+                    <div class="loading hidden" id="loadingSpinner">
+                        <div class="spinner"></div>
+                        <p>Finding similar anime...</p>
+                    </div>
+
+                    <!-- Empty State -->
+                    <div class="empty-state" id="emptyState">
+                        <div class="empty-icon">🎯</div>
+                        <h3>No recommendations yet</h3>
+                        <p>Search for an anime and click "Get Recommendations" to see similar titles.</p>
+                    </div>
+
+                    <!-- Results Table -->
+                    <div class="results-container hidden" id="resultsContainer">
+                        <div class="results-header">
+                            <span class="results-count" id="resultsCount">0 results</span>
+                            <div class="weights-display" id="weightsDisplay"></div>
+                        </div>
+                        <div class="table-container">
+                            <table class="results-table" id="resultsTable">
+                                <thead>
+                                    <tr>
+                                        <th class="col-rank">#</th>
+                                        <th class="col-image">Image</th>
+                                        <th class="col-name">Name</th>
+                                        <th class="col-score">Score</th>
+                                        <th class="col-type">Type</th>
+                                        <th class="col-hybrid">Hybrid</th>
+                                        <th class="col-tfidf">TF-IDF</th>
+                                        <th class="col-sbert">SBERT</th>
+                                        <th class="col-themes">Themes</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="resultsBody">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Similarity Comparison Chart -->
+                <div class="card chart-card hidden" id="chartCard">
+                    <h2 class="card-title">📈 Similarity Comparison</h2>
+                    <div class="chart-container" id="chartContainer"></div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Advanced Hybrid Anime Recommender System | TF-IDF + SBERT + Score Weighting</p>
+            <p class="footer-tech">Built with FastAPI, FAISS, Sentence-Transformers</p>
+        </footer>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast hidden" id="toast">
+        <span class="toast-icon">ℹ️</span>
+        <span class="toast-message" id="toastMessage"></span>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
