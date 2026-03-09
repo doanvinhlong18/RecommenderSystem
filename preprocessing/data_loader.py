@@ -1,6 +1,7 @@
 """
 Data loader module for loading and preprocessing anime datasets.
 """
+
 import pandas as pd
 import numpy as np
 import logging
@@ -9,6 +10,7 @@ from typing import Dict, Optional, Tuple
 import pickle
 
 import sys
+
 sys.path.append(str(Path(__file__).parent.parent))
 from config import DATASET_PATH, CACHE_DIR, data_config
 
@@ -80,7 +82,7 @@ class DataLoader:
             "synopsis": self.synopsis_df,
             "ratings": self.ratings_df,
             "animelist": self.animelist_df,
-            "watching_status": self.watching_status_df
+            "watching_status": self.watching_status_df,
         }
 
         with open(cache_file, "wb") as f:
@@ -117,12 +119,16 @@ class DataLoader:
         self.synopsis_df = pd.read_csv(file_path)
 
         # Rename column if needed
-        if 'sypnopsis' in self.synopsis_df.columns:
-            self.synopsis_df = self.synopsis_df.rename(columns={'sypnopsis': 'synopsis'})
+        if "sypnopsis" in self.synopsis_df.columns:
+            self.synopsis_df = self.synopsis_df.rename(
+                columns={"sypnopsis": "synopsis"}
+            )
 
         # Clean synopsis text
-        self.synopsis_df['synopsis'] = self.synopsis_df['synopsis'].fillna('')
-        self.synopsis_df['synopsis'] = self.synopsis_df['synopsis'].apply(self._clean_text)
+        self.synopsis_df["synopsis"] = self.synopsis_df["synopsis"].fillna("")
+        self.synopsis_df["synopsis"] = self.synopsis_df["synopsis"].apply(
+            self._clean_text
+        )
 
         logger.info(f"Loaded {len(self.synopsis_df)} synopses")
         return self.synopsis_df
@@ -144,7 +150,7 @@ class DataLoader:
 
         if sample:
             # Load in chunks and sample
-            logger.info(f"Sampling {data_config.rating_sample_size:,} ratings...")
+            # logger.info(f"Sampling {data_config.rating_sample_size:,} ratings...")
             chunks = []
             total_rows = 0
 
@@ -157,14 +163,13 @@ class DataLoader:
             self.ratings_df = pd.concat(chunks, ignore_index=True)
             if len(self.ratings_df) > data_config.rating_sample_size:
                 self.ratings_df = self.ratings_df.sample(
-                    n=data_config.rating_sample_size,
-                    random_state=42
+                    n=data_config.rating_sample_size, random_state=42
                 )
         else:
             self.ratings_df = pd.read_csv(file_path)
 
         # Filter out invalid ratings
-        self.ratings_df = self.ratings_df[self.ratings_df['rating'] > 0]
+        self.ratings_df = self.ratings_df[self.ratings_df["rating"] > 0]
 
         logger.info(f"Loaded {len(self.ratings_df):,} ratings")
         return self.ratings_df
@@ -198,8 +203,7 @@ class DataLoader:
             self.animelist_df = pd.concat(chunks, ignore_index=True)
             if len(self.animelist_df) > data_config.animelist_sample_size:
                 self.animelist_df = self.animelist_df.sample(
-                    n=data_config.animelist_sample_size,
-                    random_state=42
+                    n=data_config.animelist_sample_size, random_state=42
                 )
         else:
             self.animelist_df = pd.read_csv(file_path)
@@ -237,11 +241,9 @@ class DataLoader:
 
         # Merge on MAL_ID
         self._merged_df = self.anime_df.merge(
-            self.synopsis_df[['MAL_ID', 'synopsis']],
-            on='MAL_ID',
-            how='left'
+            self.synopsis_df[["MAL_ID", "synopsis"]], on="MAL_ID", how="left"
         )
-        self._merged_df['synopsis'] = self._merged_df['synopsis'].fillna('')
+        self._merged_df["synopsis"] = self._merged_df["synopsis"].fillna("")
 
         logger.info(f"Merged anime data: {len(self._merged_df)} records")
         return self._merged_df
@@ -271,19 +273,20 @@ class DataLoader:
             Cleaned DataFrame
         """
         # Handle missing values
-        df['Name'] = df['Name'].fillna('Unknown')
-        df['Genres'] = df['Genres'].fillna('')
-        df['Score'] = pd.to_numeric(df['Score'], errors='coerce').fillna(0)
+        df["Name"] = df["Name"].fillna("Unknown")
+        df["Genres"] = df["Genres"].fillna("")
+        df["Score"] = pd.to_numeric(df["Score"], errors="coerce").fillna(0)
 
         # Normalize genres
-        df['Genres'] = df['Genres'].apply(self._normalize_genres)
+        df["Genres"] = df["Genres"].str.lower()
+        df["Genres"] = df["Genres"].apply(self._normalize_genres)
 
         # Handle English name
-        if 'English name' in df.columns:
-            df['English name'] = df['English name'].fillna(df['Name'])
+        if "English name" in df.columns:
+            df["English name"] = df["English name"].fillna(df["Name"])
 
         # Remove duplicates
-        df = df.drop_duplicates(subset=['MAL_ID'], keep='first')
+        df = df.drop_duplicates(subset=["MAL_ID"], keep="first")
 
         return df
 
@@ -297,12 +300,12 @@ class DataLoader:
         Returns:
             Normalized genre string
         """
-        if pd.isna(genres) or genres == '':
-            return ''
+        if pd.isna(genres) or genres == "":
+            return ""
 
         # Split, strip, and rejoin
-        genre_list = [g.strip() for g in str(genres).split(',')]
-        return ', '.join(sorted(set(genre_list)))
+        genre_list = [g.strip() for g in str(genres).split(",")]
+        return ", ".join(sorted(set(genre_list)))
 
     def _clean_text(self, text: str) -> str:
         """
@@ -315,12 +318,12 @@ class DataLoader:
             Cleaned text
         """
         if pd.isna(text):
-            return ''
+            return ""
 
         text = str(text)
         # Remove extra whitespace
-        text = ' '.join(text.split())
-        return text
+        text = " ".join(text.split())
+        return text.lower()
 
     def get_anime_id_mapping(self) -> Tuple[Dict[int, int], Dict[int, int]]:
         """
@@ -332,7 +335,7 @@ class DataLoader:
         if self.anime_df is None:
             self.load_anime()
 
-        anime_ids = self.anime_df['MAL_ID'].unique()
+        anime_ids = self.anime_df["MAL_ID"].unique()
         id_to_idx = {aid: idx for idx, aid in enumerate(anime_ids)}
         idx_to_id = {idx: aid for aid, idx in id_to_idx.items()}
 
@@ -348,11 +351,39 @@ class DataLoader:
         if self.ratings_df is None:
             self.load_ratings()
 
-        user_ids = self.ratings_df['user_id'].unique()
+        user_ids = self.ratings_df["user_id"].unique()
         id_to_idx = {uid: idx for idx, uid in enumerate(user_ids)}
         idx_to_id = {idx: uid for uid, idx in id_to_idx.items()}
 
         return id_to_idx, idx_to_id
+
+    def get_content_base_dataframe(self) -> pd.DataFrame:
+        """
+        Prepare DataFrame for content-based feature engineering.
+        Includes cleaned year and numeric episodes.
+        """
+        df = self.get_merged_anime_data().copy()
+
+        # ---- Extract Year from Aired ----
+        if "Aired" in df.columns:
+            df["Aired"] = df["Aired"].fillna("")
+            df["year"] = df["Aired"].str.extract(r"(\d{4})")
+            df["year"] = pd.to_numeric(df["year"], errors="coerce")
+
+        # ---- Clean Episodes ----
+        if "Episodes" in df.columns:
+            df["Episodes"] = pd.to_numeric(df["Episodes"], errors="coerce")
+
+        df["Type"] = df["Type"].replace("Unknown", "TV")
+
+        # Fill missing
+        year_mode = df["year"].mode().iloc[0]
+        df["year"] = df["year"].fillna(year_mode)
+
+        mode_by_type = df.groupby("Type")["Episodes"].agg(lambda x: x.mode().iloc[0])
+        df["Episodes"] = df["Episodes"].fillna(df["Type"].map(mode_by_type))
+
+        return df
 
 
 if __name__ == "__main__":
@@ -367,4 +398,4 @@ if __name__ == "__main__":
     # Test merged data
     merged = loader.get_merged_anime_data()
     print(f"\nMerged anime data: {merged.shape}")
-    print(merged[['MAL_ID', 'Name', 'Genres', 'synopsis']].head())
+    print(merged[["MAL_ID", "Name", "Genres", "synopsis"]].head())

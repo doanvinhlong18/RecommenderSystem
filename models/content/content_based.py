@@ -1,504 +1,264 @@
-"""
-Content-Based Recommender using TF-IDF and Sentence-BERT.
-"""
 import numpy as np
 import pandas as pd
-import logging
 import pickle
-from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Union
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
-import sys
-sys.path.append(str(Path(__file__).parent.parent.parent))
-from config import MODELS_DIR, model_config
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from typing import Dict, List, Optional
+from sklearn.preprocessing import normalize
 
 
 class ContentBasedRecommender:
-    """
-    Content-based recommendation using TF-IDF and Sentence-BERT.
-
-    Computes anime-to-anime similarity based on:
-    - Genre information
-    - Synopsis text
-    - Metadata (type, source, studio)
-
-    Attributes:
-        anime_df: DataFrame with anime information
-        tfidf_vectorizer: Fitted TF-IDF vectorizer
-        tfidf_matrix: TF-IDF feature matrix
-        sbert_embeddings: SBERT embeddings (optional)
-        faiss_index: FAISS index for fast similarity search
-    """
 
     def __init__(self):
-        """Initialize ContentBasedRecommender."""
         self.anime_df: Optional[pd.DataFrame] = None
-        self.tfidf_vectorizer: Optional[TfidfVectorizer] = None
-        self.tfidf_matrix = None
-        self.sbert_model = None
-        self.sbert_embeddings: Optional[np.ndarray] = None
-        self.faiss_index = None
-        self.faiss_index_sbert = None
+        self.embeddings: Optional[np.ndarray] = None
 
-        # Mappings
         self._id_to_idx: Dict[int, int] = {}
         self._idx_to_id: Dict[int, int] = {}
         self._name_to_idx: Dict[str, int] = {}
 
-    def fit(
-        self,
-        anime_df: pd.DataFrame,
-        use_tfidf: bool = True,
-        use_sbert: bool = True,
-        use_faiss: bool = True
-    ) -> "ContentBasedRecommender":
-        """
-        Fit the content-based model.
+        # Cache MAL scores đã được parse để tránh parse lại nhiều lần
+        self._score_cache: Dict[int, float] = {}
+        # Cache cho user profile vectors để tăng tốc các lần gọi lặp
+        self._user_vector_cache: Dict[int, np.ndarray] = {}
 
-        Args:
-            anime_df: DataFrame with anime data (must have MAL_ID, Name, Genres, synopsis)
-            use_tfidf: Whether to use TF-IDF
-            use_sbert: Whether to use Sentence-BERT
-            use_faiss: Whether to use FAISS for fast search
+    # =====================================================
+    # FIT
+    # =====================================================
+    def fit(self, anime_df: pd.DataFrame, embeddings: np.ndarray):
 
-        Returns:
-            Self for chaining
-        """
+        if len(anime_df) != len(embeddings):
+            raise ValueError("Anime dataframe and embedding size mismatch")
+
         self.anime_df = anime_df.reset_index(drop=True)
 
-        # Create mappings
-        self._id_to_idx = {
-            row['MAL_ID']: idx
-            for idx, row in self.anime_df.iterrows()
-        }
-        self._idx_to_id = {idx: aid for aid, idx in self._id_to_idx.items()}
-        self._name_to_idx = {
-            row['Name'].lower(): idx
-            for idx, row in self.anime_df.iterrows()
-        }
+        # Normalize once here — dot product = cosine similarity
+        self.embeddings = normalize(embeddings.astype(np.float32))
 
-        # Add English names to mapping
-        if 'English name' in self.anime_df.columns:
-            for idx, row in self.anime_df.iterrows():
-                eng_name = row.get('English name', '')
-                if pd.notna(eng_name) and eng_name:
-                    self._name_to_idx[str(eng_name).lower()] = idx
+        ids = self.anime_df["MAL_ID"].values
+        names = self.anime_df["Name"].astype(str).str.lower().values
 
-        # Combine text features
-        combined_text = self._combine_features()
+        self._id_to_idx = {aid: i for i, aid in enumerate(ids)}
+        self._idx_to_id = {i: aid for i, aid in enumerate(ids)}
+        self._name_to_idx = {name: i for i, name in enumerate(names)}
 
-        # Fit TF-IDF
-        if use_tfidf:
-            self._fit_tfidf(combined_text)
+        if "English name" in self.anime_df.columns:
+            eng = (
+                self.anime_df["English name"].fillna("").astype(str).str.lower().values
+            )
+            for i, name in enumerate(eng):
+                if name:
+                    self._name_to_idx[name] = i
 
-        # Fit SBERT
-        if use_sbert:
-            self._fit_sbert(combined_text)
+        # Pre-build score cache khi fit — parse "Unknown"/"N/A" một lần duy nhất
+        # FIX: tránh float() crash khi Score là string không hợp lệ
+        self._score_cache = {}
+        for i, row in self.anime_df.iterrows():
+            self._score_cache[i] = self._parse_score(row.get("Score", 0))
 
-        # Build FAISS index
-        if use_faiss:
-            self._build_faiss_index()
+        # Clear any cached user vectors when model changes
+        self._user_vector_cache.clear()
 
-        logger.info(f"ContentBasedRecommender fitted on {len(self.anime_df)} anime")
         return self
 
-    def _combine_features(self) -> List[str]:
-        """
-        Combine text features for each anime.
+    # =====================================================
+    # SIMILAR ITEM
+    # =====================================================
+    def get_similar_anime(self, identifier, top_k=10):
 
-        Returns:
-            List of combined text strings
-        """
-        combined = []
-
-        for _, row in self.anime_df.iterrows():
-            parts = []
-
-            # Genres (repeated for emphasis)
-            genres = str(row.get('Genres', ''))
-            if genres and genres != 'nan':
-                parts.extend([genres] * 2)
-
-            # Synopsis
-            synopsis = str(row.get('synopsis', ''))
-            if synopsis and synopsis != 'nan':
-                parts.append(synopsis)
-
-            # Type
-            type_val = str(row.get('Type', ''))
-            if type_val and type_val not in ['nan', 'Unknown']:
-                parts.append(type_val)
-
-            # Source
-            source = str(row.get('Source', ''))
-            if source and source not in ['nan', 'Unknown']:
-                parts.append(source)
-
-            # Studios
-            studios = str(row.get('Studios', ''))
-            if studios and studios not in ['nan', 'Unknown']:
-                parts.append(studios)
-
-            combined.append(' '.join(parts) if parts else '')
-
-        return combined
-
-    def _fit_tfidf(self, texts: List[str]) -> None:
-        """
-        Fit TF-IDF vectorizer.
-
-        Args:
-            texts: List of text documents
-        """
-        logger.info("Fitting TF-IDF vectorizer...")
-
-        self.tfidf_vectorizer = TfidfVectorizer(
-            max_features=model_config.tfidf_max_features,
-            stop_words='english',
-            ngram_range=(1, 2),
-            min_df=2,
-            max_df=0.95
-        )
-
-        self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(texts)
-        logger.info(f"TF-IDF matrix shape: {self.tfidf_matrix.shape}")
-
-    def _fit_sbert(self, texts: List[str]) -> None:
-        """
-        Generate Sentence-BERT embeddings.
-
-        Args:
-            texts: List of text documents
-        """
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            logger.warning("sentence-transformers not installed. Skipping SBERT.")
-            return
-
-        logger.info(f"Loading SBERT model: {model_config.sbert_model_name}...")
-        self.sbert_model = SentenceTransformer(model_config.sbert_model_name)
-
-        logger.info(f"Encoding {len(texts)} texts with SBERT...")
-        self.sbert_embeddings = self.sbert_model.encode(
-            texts,
-            batch_size=32,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=True
-        )
-        logger.info(f"SBERT embeddings shape: {self.sbert_embeddings.shape}")
-
-    def _build_faiss_index(self) -> None:
-        """Build FAISS index for fast similarity search."""
-        try:
-            import faiss
-        except ImportError:
-            logger.warning("FAISS not installed. Using sklearn cosine similarity.")
-            return
-
-        # Build index for SBERT embeddings (preferred)
-        if self.sbert_embeddings is not None:
-            logger.info("Building FAISS index for SBERT embeddings...")
-            d = self.sbert_embeddings.shape[1]
-
-            # Use IVF for large datasets
-            if len(self.sbert_embeddings) > 10000:
-                nlist = min(model_config.faiss_nlist, len(self.sbert_embeddings) // 100)
-                quantizer = faiss.IndexFlatIP(d)
-                self.faiss_index_sbert = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
-                self.faiss_index_sbert.train(self.sbert_embeddings.astype(np.float32))
-                self.faiss_index_sbert.add(self.sbert_embeddings.astype(np.float32))
-                self.faiss_index_sbert.nprobe = model_config.faiss_nprobe
-            else:
-                self.faiss_index_sbert = faiss.IndexFlatIP(d)
-                self.faiss_index_sbert.add(self.sbert_embeddings.astype(np.float32))
-
-            logger.info(f"FAISS SBERT index built with {self.faiss_index_sbert.ntotal} vectors")
-
-        # Build index for TF-IDF (dense)
-        if self.tfidf_matrix is not None:
-            logger.info("Building FAISS index for TF-IDF...")
-            tfidf_dense = self.tfidf_matrix.toarray().astype(np.float32)
-            # Normalize for cosine similarity
-            norms = np.linalg.norm(tfidf_dense, axis=1, keepdims=True)
-            norms[norms == 0] = 1
-            tfidf_dense = tfidf_dense / norms
-
-            d = tfidf_dense.shape[1]
-            self.faiss_index = faiss.IndexFlatIP(d)
-            self.faiss_index.add(tfidf_dense)
-
-            logger.info(f"FAISS TF-IDF index built with {self.faiss_index.ntotal} vectors")
-
-    def get_similar_anime(
-        self,
-        anime_identifier: Union[int, str],
-        top_k: int = 10,
-        method: str = "hybrid"
-    ) -> List[Dict]:
-        """
-        Get similar anime recommendations.
-
-        Args:
-            anime_identifier: Anime ID (int) or name (str)
-            top_k: Number of recommendations
-            method: "tfidf", "sbert", or "hybrid"
-
-        Returns:
-            List of recommendation dictionaries
-        """
-        # Find anime index
-        idx = self._get_anime_idx(anime_identifier)
+        idx = self._get_idx(identifier)
         if idx is None:
-            logger.warning(f"Anime not found: {anime_identifier}")
             return []
 
-        # Get similarities based on method
-        if method == "tfidf":
-            similar_indices, scores = self._get_tfidf_similar(idx, top_k + 1)
-        elif method == "sbert":
-            similar_indices, scores = self._get_sbert_similar(idx, top_k + 1)
-        else:  # hybrid
-            similar_indices, scores = self._get_hybrid_similar(idx, top_k + 1)
+        query = self.embeddings[idx]
 
-        # Build results (exclude query anime)
+        sims = self.embeddings @ query
+        sims = np.maximum(sims, 0)
+        sims[idx] = -1
+
+        top_indices = np.argpartition(-sims, top_k)[:top_k]
+        top_indices = top_indices[np.argsort(-sims[top_indices])]
+
         results = []
-        for sim_idx, score in zip(similar_indices, scores):
-            if sim_idx == idx:
-                continue
-            if len(results) >= top_k:
-                break
-
-            anime_row = self.anime_df.iloc[sim_idx]
-            results.append({
-                'mal_id': int(anime_row['MAL_ID']),
-                'name': anime_row['Name'],
-                'english_name': anime_row.get('English name', anime_row['Name']),
-                'genres': anime_row.get('Genres', ''),
-                'score': float(anime_row.get('Score', 0)),
-                'similarity': float(score),
-                'type': anime_row.get('Type', 'Unknown')
-            })
+        for i in top_indices:
+            row = self.anime_df.iloc[i]
+            results.append(
+                {
+                    "mal_id": int(row["MAL_ID"]),
+                    "name": row["Name"],
+                    "similarity": float(
+                        sims[i]
+                    ),  # key là "similarity" — dùng nhất quán
+                    "score": self._score_cache.get(i, 0.0),
+                }
+            )
 
         return results
 
-    def _get_anime_idx(self, identifier: Union[int, str]) -> Optional[int]:
+    # =====================================================
+    # USER PROFILE RECOMMENDATION
+    # =====================================================
+    def build_user_vector(
+        self,
+        user_ratings: Dict[int, float],
+        all_ratings: Dict[int, float] = None,
+        positive_percentile: float = 75.0,
+        negative_percentile: float = 25.0,
+        negative_weight: float = 0.4,
+    ) -> np.ndarray:
         """
-        Get anime index from ID or name.
+        Build normalized user vector từ anime ratings.
+
+        Ngưỡng positive/negative được tính theo percentile của chính user,
+        thay vì hardcode — adaptive với từng user có rating pattern khác nhau.
+
+        Ví dụ user chỉ rate 6-8:
+          positive_percentile=75 → ngưỡng ~7.5  (top 25% ratings của user)
+          negative_percentile=25 → ngưỡng ~6.5  (bottom 25% ratings của user)
+
+        Positive weighting:  rating - pos_threshold  (càng cao hơn ngưỡng → weight lớn)
+        Negative weighting:  neg_threshold - rating  (càng thấp hơn ngưỡng → weight lớn)
+        → Cả hai đều dùng khoảng cách từ ngưỡng, symmetric.
 
         Args:
-            identifier: Anime ID or name
+            user_ratings:        {item_id: rating} dùng để build positive vector
+                                 (thường là train items trong evaluation)
+            all_ratings:         {item_id: rating} toàn bộ ratings của user,
+                                 dùng để tính percentile và lấy negative signal.
+                                 Nếu None thì fallback về user_ratings.
+            positive_percentile: Percentile để tính pos_threshold (default 75.0)
+                                 Items có rating >= percentile này → liked
+            negative_percentile: Percentile để tính neg_threshold (default 25.0)
+                                 Items có rating <= percentile này → disliked
+            negative_weight:     Mức độ trừ negative vector (default 0.4)
 
         Returns:
-            Index or None if not found
+            Normalized user vector (np.float32), hoặc None nếu không có liked items.
         """
+        source_ratings = all_ratings if all_ratings is not None else user_ratings
+
+        # ── Tính ngưỡng theo percentile của user ─────────────────────────────
+        all_rating_vals = np.array(list(source_ratings.values()), dtype=np.float32)
+
+        pos_threshold = float(np.percentile(all_rating_vals, positive_percentile))
+        neg_threshold = float(np.percentile(all_rating_vals, negative_percentile))
+
+        # Edge case: nếu toàn bộ rating bằng nhau thì không có signal
+        # → dùng vector trung bình đơn giản
+        if pos_threshold == neg_threshold:
+            indices = [
+                self._id_to_idx[i]
+                for i in user_ratings
+                if self._id_to_idx.get(i) is not None
+            ]
+            if not indices:
+                return None
+            vec = self.embeddings[indices].mean(axis=0).astype(np.float32)
+            norm = np.linalg.norm(vec)
+            return (vec / norm) if norm > 0 else vec
+
+        # ── Positive vector ───────────────────────────────────────────────────
+        # Dùng user_ratings (train items) để tránh leak test item
+        pos_indices = []
+        pos_weights = []
+
+        for item_id, rating in user_ratings.items():
+            if rating < pos_threshold:
+                continue
+            idx = self._id_to_idx.get(item_id)
+            if idx is None:
+                continue
+            pos_indices.append(idx)
+            # Khoảng cách trên ngưỡng → weight (đối xứng với negative)
+            pos_weights.append(rating - pos_threshold)
+
+        if not pos_indices:
+            return None
+
+        pos_vecs = self.embeddings[pos_indices]
+        pos_w = np.array(pos_weights, dtype=np.float32)
+        pos_w = np.maximum(pos_w, 1e-6)  # tránh zero weight khi đúng bằng ngưỡng
+        pos_vector = np.average(pos_vecs, axis=0, weights=pos_w)
+        pos_norm = np.linalg.norm(pos_vector)
+        if pos_norm > 0:
+            pos_vector /= pos_norm
+
+        # ── Negative vector ───────────────────────────────────────────────────
+        # Dùng source_ratings (all_ratings) để lấy đủ dislike signal
+        # Không gây data leak: disliked items (bottom percentile) rất khó trùng
+        # test item (top percentile) khi pos_threshold != neg_threshold
+        neg_indices = []
+        neg_weights = []
+
+        for item_id, rating in source_ratings.items():
+            if rating > neg_threshold:
+                continue
+            idx = self._id_to_idx.get(item_id)
+            if idx is None:
+                continue
+            neg_indices.append(idx)
+            # Khoảng cách dưới ngưỡng → weight (đối xứng với positive)
+            neg_weights.append(neg_threshold - rating)
+
+        user_vector = pos_vector  # default nếu không có negative signal
+
+        if neg_indices:
+            neg_vecs = self.embeddings[neg_indices]
+            neg_w = np.array(neg_weights, dtype=np.float32)
+            neg_w = np.maximum(neg_w, 1e-6)
+            neg_vector = np.average(neg_vecs, axis=0, weights=neg_w)
+            neg_norm = np.linalg.norm(neg_vector)
+            if neg_norm > 0:
+                neg_vector /= neg_norm
+
+            user_vector = pos_vector - negative_weight * neg_vector
+            u_norm = np.linalg.norm(user_vector)
+            if u_norm > 0:
+                user_vector /= u_norm
+
+        return user_vector.astype(np.float32)
+
+    # =====================================================
+    # UTIL
+    # =====================================================
+    def _get_idx(self, identifier):
         if isinstance(identifier, int):
             return self._id_to_idx.get(identifier)
+        name = str(identifier).lower()
+        return self._name_to_idx.get(name)
 
-        # Try exact match
-        name_lower = str(identifier).lower()
-        if name_lower in self._name_to_idx:
-            return self._name_to_idx[name_lower]
+    # FIX: Method tên nhất quán — hybrid.py gọi _get_idx, không phải _get_anime_idx
+    # Thêm alias để backward compatible nếu có code cũ dùng tên cũ
+    def _get_anime_idx(self, identifier):
+        return self._get_idx(identifier)
 
-        # Try partial match
-        for name, idx in self._name_to_idx.items():
-            if name_lower in name or name in name_lower:
-                return idx
-
-        return None
-
-    def _get_tfidf_similar(
-        self,
-        idx: int,
-        top_k: int
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Get similar items using TF-IDF."""
-        if self.faiss_index is not None:
-            # Use FAISS
-            query = self.tfidf_matrix[idx].toarray().astype(np.float32)
-            norm = np.linalg.norm(query)
-            if norm > 0:
-                query = query / norm
-            scores, indices = self.faiss_index.search(query, top_k)
-            return indices[0], scores[0]
-        else:
-            # Use sklearn
-            query = self.tfidf_matrix[idx:idx+1]
-            similarities = cosine_similarity(query, self.tfidf_matrix).flatten()
-            indices = similarities.argsort()[::-1][:top_k]
-            return indices, similarities[indices]
-
-    def _get_sbert_similar(
-        self,
-        idx: int,
-        top_k: int
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Get similar items using SBERT."""
-        if self.sbert_embeddings is None:
-            return self._get_tfidf_similar(idx, top_k)
-
-        if self.faiss_index_sbert is not None:
-            # Use FAISS
-            query = self.sbert_embeddings[idx:idx+1].astype(np.float32)
-            scores, indices = self.faiss_index_sbert.search(query, top_k)
-            return indices[0], scores[0]
-        else:
-            # Use sklearn
-            query = self.sbert_embeddings[idx:idx+1]
-            similarities = cosine_similarity(query, self.sbert_embeddings).flatten()
-            indices = similarities.argsort()[::-1][:top_k]
-            return indices, similarities[indices]
-
-    def _get_hybrid_similar(
-        self,
-        idx: int,
-        top_k: int
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Get similar items using hybrid of TF-IDF and SBERT."""
-        # Get both similarities
-        tfidf_indices, tfidf_scores = self._get_tfidf_similar(idx, top_k * 2)
-
-        if self.sbert_embeddings is not None:
-            sbert_indices, sbert_scores = self._get_sbert_similar(idx, top_k * 2)
-
-            # Normalize scores
-            tfidf_scores = (tfidf_scores - tfidf_scores.min()) / (tfidf_scores.max() - tfidf_scores.min() + 1e-8)
-            sbert_scores = (sbert_scores - sbert_scores.min()) / (sbert_scores.max() - sbert_scores.min() + 1e-8)
-
-            # Combine scores
-            combined_scores = {}
-            for i, score in zip(tfidf_indices, tfidf_scores):
-                combined_scores[i] = combined_scores.get(i, 0) + 0.4 * score
-            for i, score in zip(sbert_indices, sbert_scores):
-                combined_scores[i] = combined_scores.get(i, 0) + 0.6 * score
-
-            # Sort by combined score
-            sorted_items = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
-            indices = np.array([i for i, _ in sorted_items[:top_k]])
-            scores = np.array([s for _, s in sorted_items[:top_k]])
-
-            return indices, scores
-        else:
-            return tfidf_indices[:top_k], tfidf_scores[:top_k]
-
-    def search_anime(
-        self,
-        query: str,
-        top_k: int = 10
-    ) -> List[Dict]:
+    @staticmethod
+    def _parse_score(raw) -> float:
         """
-        Search for anime by name.
+        FIX: Parse MAL score an toàn — handle "Unknown", "N/A", None, NaN.
 
         Args:
-            query: Search query
-            top_k: Number of results
+            raw: Raw score value từ DataFrame
 
         Returns:
-            List of matching anime
+            float score, 0.0 nếu không parse được
         """
-        query_lower = query.lower()
-        results = []
+        if raw is None:
+            return 0.0
+        if isinstance(raw, (int, float)):
+            return (
+                0.0
+                if (np.isnan(raw) if isinstance(raw, float) else False)
+                else float(raw)
+            )
+        try:
+            return float(str(raw).strip())
+        except (ValueError, TypeError):
+            return 0.0
 
-        for idx, row in self.anime_df.iterrows():
-            name = str(row['Name']).lower()
-            eng_name = str(row.get('English name', '')).lower()
+    def save(self, path):
+        with open(path, "wb") as f:
+            pickle.dump(self.__dict__, f)
 
-            if query_lower in name or query_lower in eng_name:
-                results.append({
-                    'mal_id': int(row['MAL_ID']),
-                    'name': row['Name'],
-                    'english_name': row.get('English name', row['Name']),
-                    'genres': row.get('Genres', ''),
-                    'score': float(row.get('Score', 0)),
-                    'type': row.get('Type', 'Unknown')
-                })
-
-        # Sort by score
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:top_k]
-
-    def save(self, filepath: Union[str, Path]) -> None:
-        """
-        Save model to file.
-
-        Args:
-            filepath: Path to save file
-        """
-        filepath = Path(filepath)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-
-        state = {
-            'anime_df': self.anime_df,
-            'tfidf_vectorizer': self.tfidf_vectorizer,
-            'tfidf_matrix': self.tfidf_matrix,
-            'sbert_embeddings': self.sbert_embeddings,
-            'id_to_idx': self._id_to_idx,
-            'idx_to_id': self._idx_to_id,
-            'name_to_idx': self._name_to_idx
-        }
-
-        with open(filepath, 'wb') as f:
-            pickle.dump(state, f)
-
-        logger.info(f"ContentBasedRecommender saved to {filepath}")
-
-    def load(self, filepath: Union[str, Path]) -> "ContentBasedRecommender":
-        """
-        Load model from file.
-
-        Args:
-            filepath: Path to saved file
-
-        Returns:
-            Self for chaining
-        """
-        filepath = Path(filepath)
-
-        with open(filepath, 'rb') as f:
-            state = pickle.load(f)
-
-        self.anime_df = state['anime_df']
-        self.tfidf_vectorizer = state['tfidf_vectorizer']
-        self.tfidf_matrix = state['tfidf_matrix']
-        self.sbert_embeddings = state['sbert_embeddings']
-        self._id_to_idx = state['id_to_idx']
-        self._idx_to_id = state['idx_to_id']
-        self._name_to_idx = state['name_to_idx']
-
-        # Rebuild FAISS index
-        self._build_faiss_index()
-
-        logger.info(f"ContentBasedRecommender loaded from {filepath}")
+    def load(self, path):
+        with open(path, "rb") as f:
+            self.__dict__.update(pickle.load(f))
         return self
-
-
-if __name__ == "__main__":
-    # Test content-based recommender
-    import sys
-    sys.path.append(str(Path(__file__).parent.parent.parent))
-    from preprocessing import DataLoader
-
-    loader = DataLoader()
-    merged_df = loader.get_merged_anime_data()
-
-    recommender = ContentBasedRecommender()
-    recommender.fit(merged_df, use_sbert=False)  # Skip SBERT for quick test
-
-    # Test recommendations
-    test_anime = "Naruto"
-    print(f"\nRecommendations similar to '{test_anime}':")
-    recommendations = recommender.get_similar_anime(test_anime, top_k=5, method="tfidf")
-    for rec in recommendations:
-        print(f"  {rec['name']} (Score: {rec['score']}, Similarity: {rec['similarity']:.4f})")
-
-    # Test search
-    print(f"\nSearch results for 'death':")
-    search_results = recommender.search_anime("death", top_k=5)
-    for result in search_results:
-        print(f"  {result['name']} (Score: {result['score']})")

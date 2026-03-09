@@ -1,6 +1,7 @@
 """
 Configuration settings for the Anime Recommendation System.
 """
+
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -13,7 +14,8 @@ MODELS_DIR = BASE_DIR / "saved_models"
 CACHE_DIR = BASE_DIR / "cache"
 
 # Dataset paths
-DATASET_PATH = Path(r"C:\Users\ACER\.cache\kagglehub\datasets\hernan4444\anime-recommendation-database-2020\versions\7")
+DATASET_PATH = BASE_DIR / "data"
+
 
 # Create directories if they don't exist
 for dir_path in [DATA_DIR, MODELS_DIR, CACHE_DIR]:
@@ -23,6 +25,7 @@ for dir_path in [DATA_DIR, MODELS_DIR, CACHE_DIR]:
 @dataclass
 class DataConfig:
     """Data configuration settings."""
+
     anime_file: str = "anime.csv"
     anime_synopsis_file: str = "anime_with_synopsis.csv"
     animelist_file: str = "animelist.csv"
@@ -30,20 +33,20 @@ class DataConfig:
     watching_status_file: str = "watching_status.csv"
 
     # Sampling settings for large datasets
-    sample_ratings: bool = True
-    rating_sample_size: int = 5_000_000  # 5M samples for development
+    sample_ratings: bool = False
+    rating_sample_size: int = 10_000_000  # 5M samples for development
     animelist_sample_size: int = 10_000_000  # 10M samples
 
     # Minimum thresholds
-    min_user_ratings: int = 5
-    min_anime_ratings: int = 10
+    min_user_ratings: int = 15
+    min_anime_ratings: int = 30
 
 
 @dataclass
 class ModelConfig:
     """Model configuration settings."""
+
     # Content-based settings
-    tfidf_max_features: int = 5000
     sbert_model_name: str = "all-MiniLM-L6-v2"
     content_weight: float = 0.3
 
@@ -68,17 +71,20 @@ class ModelConfig:
     faiss_nprobe: int = 10  # Number of clusters to search
 
     # Hybrid weights
-    hybrid_weights: Dict[str, float] = field(default_factory=lambda: {
-        "content": 0.3,
-        "collaborative": 0.4,
-        "implicit": 0.2,
-        "popularity": 0.1
-    })
+    hybrid_weights: Dict[str, float] = field(
+        default_factory=lambda: {
+            "content": 0.25,
+            "collaborative": 0.3,
+            "implicit": 0.35,
+            "popularity": 0.1,
+        }
+    )
 
 
 @dataclass
 class APIConfig:
     """API configuration settings."""
+
     host: str = "0.0.0.0"
     port: int = 8000
     debug: bool = True
@@ -89,6 +95,7 @@ class APIConfig:
 @dataclass
 class EvaluationConfig:
     """Evaluation configuration settings."""
+
     test_size: float = 0.2
     k_values: tuple = (5, 10, 20)
     random_state: int = 42
