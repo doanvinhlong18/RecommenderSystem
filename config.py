@@ -12,13 +12,17 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 MODELS_DIR = BASE_DIR / "saved_models"
 CACHE_DIR = BASE_DIR / "cache"
+SPLITS_DIR = MODELS_DIR / "splits"
 
 # Dataset paths
-DATASET_PATH = BASE_DIR / "data"
+DATASET_PATH = DATA_DIR
+DEFAULT_DATASET_SUBDIR = DATA_DIR / "anime-recommendation-database-2020"
+if DEFAULT_DATASET_SUBDIR.exists():
+    DATASET_PATH = DEFAULT_DATASET_SUBDIR
 
 
 # Create directories if they don't exist
-for dir_path in [DATA_DIR, MODELS_DIR, CACHE_DIR]:
+for dir_path in [DATA_DIR, MODELS_DIR, CACHE_DIR, SPLITS_DIR]:
     dir_path.mkdir(exist_ok=True)
 
 
