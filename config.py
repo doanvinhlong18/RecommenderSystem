@@ -60,6 +60,16 @@ class ModelConfig:
     svd_lr: float = 0.005
     svd_reg: float = 0.02
 
+    # BPR collaborative settings
+    bpr_factors: int = 50
+    bpr_iterations: int = 30
+    bpr_learning_rate: float = 0.05
+    bpr_regularization: float = 0.01
+    bpr_positive_rating_threshold: float = 7.0
+    bpr_verify_negative_samples: bool = True
+    bpr_use_implicit_signal: bool = True
+    bpr_warm_start_from_als: bool = True
+
     # ALS settings
     als_factors: int = 50
     als_iterations: int = 15

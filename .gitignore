@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 venv/
 .venv/
+.venv311/
 env/
 build/
 dist/
@@ -18,3 +19,4 @@ Thumbs.db
 *.npz
 data
 .tmp/
+.python311*

@@ -1,0 +1,73 @@
+{
+  "timestamp": "2026-03-22 00:50:09",
+  "split_path": "saved_models\\splits\\benchmark_small_collab_split_200k.pkl",
+  "model": {
+    "method": "bpr",
+    "n_factors": 50,
+    "n_epochs": 30,
+    "learning_rate": 0.05,
+    "regularization": 0.01,
+    "rating_positive_threshold": 7.0,
+    "use_implicit_signal": true,
+    "warm_start_from_als": true
+  },
+  "split_metadata": {
+    "version": 1,
+    "random_state": 42,
+    "test_ratio": 0.2,
+    "relevance_threshold": 7.0,
+    "leave_one_out": false,
+    "min_train_items": 10,
+    "min_test_items": 3,
+    "source_rows": 200000,
+    "eval_users": 3656,
+    "train_interactions": 161324,
+    "test_interactions": 28546
+  },
+  "data": {
+    "train_users": 3152,
+    "train_items": 1402,
+    "train_ratings": 109468,
+    "implicit_interactions": 959346,
+    "filtered_animelist_rows": 1024905
+  },
+  "timings_seconds": {
+    "rating_matrix": 0.035002708435058594,
+    "implicit_matrix": 0.24199652671813965,
+    "implicit_als_train": 2.1324260234832764,
+    "bpr_train": 3.185206651687622,
+    "evaluation": 2.6377172470092773
+  },
+  "results": {
+    "K=5": {
+      "precision": 0.1984771573604061,
+      "recall": 0.13654019422268418,
+      "f1": 0.14722924381528923,
+      "hit_rate": 0.6186548223350253,
+      "mrr": 0.4281408629441624,
+      "ndcg": 0.23474272533689614,
+      "map": 0.15268982656514382,
+      "evaluated_users": 3152
+    },
+    "K=10": {
+      "precision": 0.14857233502538073,
+      "recall": 0.19840044419333383,
+      "f1": 0.15346553724293746,
+      "hit_rate": 0.7338197969543148,
+      "mrr": 0.44341964789299815,
+      "ndcg": 0.23057306081813095,
+      "map": 0.1290792335276374,
+      "evaluated_users": 3152
+    },
+    "K=20": {
+      "precision": 0.10729695431472083,
+      "recall": 0.2811196220774619,
+      "f1": 0.14172296576260415,
+      "hit_rate": 0.8391497461928934,
+      "mrr": 0.45085765271315065,
+      "ndcg": 0.25378556684872333,
+      "map": 0.1300030738614691,
+      "evaluated_users": 3152
+    }
+  }
+}

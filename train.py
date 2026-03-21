@@ -70,7 +70,10 @@ def train_collaborative_model(
     idx_to_anime,
     user_to_idx,
     idx_to_user,
-    method: str = "svd"
+    method: str = "bpr",
+    implicit_matrix=None,
+    implicit_model=None,
+    positive_rating_threshold: float = None,
 ) -> MatrixFactorization:
     """Train collaborative filtering model."""
     logger.info("=" * 50)
@@ -79,17 +82,35 @@ def train_collaborative_model(
 
     start_time = time.time()
 
-    model = MatrixFactorization(
-        n_factors=model_config.svd_factors,
-        n_epochs=model_config.svd_epochs,
-        method=method
-    )
+    if method == "bpr":
+        model = MatrixFactorization(
+            n_factors=model_config.bpr_factors,
+            n_epochs=model_config.bpr_iterations,
+            learning_rate=model_config.bpr_learning_rate,
+            regularization=model_config.bpr_regularization,
+            method=method,
+            rating_positive_threshold=positive_rating_threshold,
+            verify_negative_samples=model_config.bpr_verify_negative_samples,
+            use_implicit_signal=model_config.bpr_use_implicit_signal,
+            warm_start_from_als=model_config.bpr_warm_start_from_als,
+        )
+    else:
+        model = MatrixFactorization(
+            n_factors=model_config.svd_factors,
+            n_epochs=model_config.svd_epochs,
+            learning_rate=model_config.svd_lr,
+            regularization=model_config.svd_reg,
+            method=method,
+        )
+
     model.fit(
         user_item_matrix,
         anime_to_idx,
         idx_to_anime,
         user_to_idx,
-        idx_to_user
+        idx_to_user,
+        implicit_matrix=implicit_matrix,
+        implicit_model=implicit_model,
     )
 
     elapsed = time.time() - start_time
@@ -230,7 +251,7 @@ def main():
     parser.add_argument("--skip-collaborative", action="store_true", help="Skip collaborative filtering")
     parser.add_argument("--skip-implicit", action="store_true", help="Skip implicit feedback model")
     parser.add_argument("--sample-size", type=int, default=None, help="Sample size for ratings")
-    parser.add_argument("--cf-method", type=str, default="svd", choices=["svd", "als"], help="CF method")
+    parser.add_argument("--cf-method", type=str, default="bpr", choices=["bpr", "svd", "als"], help="CF method")
     parser.add_argument(
         "--split-path",
         type=str,
@@ -303,21 +324,7 @@ def main():
     # 1. Content-Based
     content_model = train_content_model(anime_df, use_sbert=not args.skip_sbert)
 
-    # 2. Collaborative Filtering
-    if not args.skip_collaborative:
-        collaborative_model = train_collaborative_model(
-            matrix_builder.user_item_matrix,
-            matrix_builder.anime_to_idx,
-            matrix_builder.idx_to_anime,
-            matrix_builder.user_to_idx,
-            matrix_builder.idx_to_user,
-            method=args.cf_method
-        )
-    else:
-        collaborative_model = None
-        logger.info("Skipping Collaborative Filtering")
-
-    # 3. Implicit Feedback
+    # 2. Implicit Feedback
     if not args.skip_implicit:
         implicit_model = train_implicit_model(
             matrix_builder.implicit_matrix,
@@ -329,6 +336,23 @@ def main():
     else:
         implicit_model = None
         logger.info("Skipping Implicit Feedback Model")
+
+    # 3. Collaborative Filtering
+    if not args.skip_collaborative:
+        collaborative_model = train_collaborative_model(
+            matrix_builder.user_item_matrix,
+            matrix_builder.anime_to_idx,
+            matrix_builder.idx_to_anime,
+            matrix_builder.user_to_idx,
+            matrix_builder.idx_to_user,
+            method=args.cf_method,
+            implicit_matrix=matrix_builder.implicit_matrix,
+            implicit_model=implicit_model,
+            positive_rating_threshold=args.relevance_threshold,
+        )
+    else:
+        collaborative_model = None
+        logger.info("Skipping Collaborative Filtering")
 
     # 4. Popularity
     popularity_model = train_popularity_model(anime_df, train_ratings_df, train_animelist_df)
