@@ -1,0 +1,82 @@
+{
+  "timestamp": "2026-03-22 01:27:14",
+  "split_dir": "saved_models\\bench_newflow_200k_split",
+  "model_dir": "saved_models\\bench_newflow_200k_svd",
+  "model": {
+    "method": "svd",
+    "n_factors": 100,
+    "n_epochs": 20,
+    "learning_rate": 0.005,
+    "regularization": 0.02,
+    "rating_positive_threshold": 7.0,
+    "use_implicit_signal": true,
+    "warm_start_from_als": true
+  },
+  "split_metadata": {
+    "version": 2,
+    "format": "csv_split",
+    "random_state": 42,
+    "test_ratio": 0.2,
+    "relevance_threshold": 7.0,
+    "leave_one_out": false,
+    "min_train_items": 10,
+    "min_test_items": 3,
+    "source_rows": 200000,
+    "eval_users": 971,
+    "train_interactions": 169353,
+    "test_interactions": 30077,
+    "train_csv": "saved_models\\bench_newflow_200k_split\\train_ratings.csv",
+    "test_csv": "saved_models\\bench_newflow_200k_split\\test_ratings.csv"
+  },
+  "data": {
+    "train_users_after_filters": 951,
+    "train_items_after_filters": 1473,
+    "train_ratings_after_filters": 121203,
+    "heldout_eval_users": 971,
+    "heldout_test_interactions": 30077,
+    "implicit_interactions": 0
+  },
+  "timings_seconds": {
+    "split_creation_or_load": 0.0,
+    "test_map_load": 0.05300402641296387,
+    "rating_matrix": 0.18599557876586914,
+    "implicit_matrix": 0.0,
+    "implicit_train": 0.0,
+    "collaborative_train": 42.64895296096802,
+    "evaluation": 1.293311595916748,
+    "total": 44.19025945663452
+  },
+  "results": {
+    "K=5": {
+      "precision": 0.08159831756046267,
+      "recall": 0.014913330596712451,
+      "f1": 0.02260466766774507,
+      "hit_rate": 0.29547844374342797,
+      "mrr": 0.172397476340694,
+      "ndcg": 0.08658368313671011,
+      "map": 0.049384858044164044,
+      "evaluated_users": 951
+    },
+    "K=10": {
+      "precision": 0.07181913774973712,
+      "recall": 0.026017670008818775,
+      "f1": 0.0328929361079764,
+      "hit_rate": 0.40904311251314407,
+      "mrr": 0.18707459149099528,
+      "ndcg": 0.07940541554819046,
+      "map": 0.034699159018672314,
+      "evaluated_users": 951
+    },
+    "K=20": {
+      "precision": 0.06303890641430074,
+      "recall": 0.044710916451205084,
+      "f1": 0.04411432044005055,
+      "hit_rate": 0.5499474237644585,
+      "mrr": 0.19652708573451122,
+      "ndcg": 0.07579285529367064,
+      "map": 0.025688878704265807,
+      "evaluated_users": 951
+    },
+    "skipped_not_in_model": 20
+  }
+}
