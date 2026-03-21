@@ -1,0 +1,67 @@
+{
+  "timestamp": "2026-03-22 00:11:30",
+  "dataset_path": "D:\\1.HOC\\RS\\RecommenderSystem\\data\\anime-recommendation-database-2020",
+  "sample_size": 50000,
+  "split_path": "D:\\1.HOC\\RS\\RecommenderSystem\\saved_models\\splits\\benchmark_small_collab_split.pkl",
+  "split_metadata": {
+    "version": 1,
+    "random_state": 42,
+    "test_ratio": 0.2,
+    "relevance_threshold": 7.0,
+    "leave_one_out": false,
+    "min_train_items": 10,
+    "min_test_items": 3,
+    "source_rows": 50000,
+    "eval_users": 1287,
+    "train_interactions": 26450,
+    "test_interactions": 4923
+  },
+  "train_rows": 26450,
+  "matrix_shape": [
+    282,
+    10
+  ],
+  "matrix_nnz": 346,
+  "model": {
+    "type": "MatrixFactorization",
+    "method": "svd",
+    "n_factors": 100,
+    "n_epochs": 20,
+    "learning_rate": 0.005,
+    "regularization": 0.02,
+    "global_mean": 8.245664596557617
+  },
+  "results": {
+    "K=5": {
+      "precision": 0.003703703703703704,
+      "recall": 0.006172839506172839,
+      "f1": 0.004629629629629629,
+      "hit_rate": 0.018518518518518517,
+      "mrr": 0.006172839506172839,
+      "ndcg": 0.004345173389099597,
+      "map": 0.0020576131687242796,
+      "evaluated_users": 54
+    },
+    "K=10": {
+      "precision": 0.007407407407407408,
+      "recall": 0.022222222222222223,
+      "f1": 0.011016144349477683,
+      "hit_rate": 0.07407407407407407,
+      "mrr": 0.013962375073486185,
+      "ndcg": 0.012150373936949658,
+      "map": 0.004301391338428375,
+      "evaluated_users": 54
+    },
+    "K=20": {
+      "precision": 0.003703703703703704,
+      "recall": 0.022222222222222223,
+      "f1": 0.006312399355877617,
+      "hit_rate": 0.07407407407407407,
+      "mrr": 0.013962375073486185,
+      "ndcg": 0.012150373936949658,
+      "map": 0.004301391338428375,
+      "evaluated_users": 54
+    }
+  },
+  "elapsed_seconds": 3.07
+}
