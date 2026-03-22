@@ -20,3 +20,5 @@ Thumbs.db
 data
 .tmp/
 .python311*
+*.csv
+saved_models/
