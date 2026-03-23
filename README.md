@@ -6,14 +6,25 @@ A production-ready hybrid recommendation system for anime using multiple techniq
 - **Implicit Feedback** (ALS)
 - **Popularity-Based** (Top Rated, Most Watched, Trending)
 
+## 🚀 GPU Acceleration Support
+
+This system supports GPU acceleration for faster training:
+- **SBERT** embeddings on CUDA
+- **FAISS** GPU for similarity search
+- **PyTorch** based Matrix Factorization
+- **Implicit ALS** GPU implementation
+
 ## 📁 Project Structure
 
 ```
 RecommenderSystem/
 ├── config.py                 # Configuration settings
+├── device_config.py          # GPU/CPU device management
 ├── train.py                  # Training script
+├── check_gpu.py              # GPU setup verification
 ├── run_server.py             # API server runner
 ├── requirements.txt          # Dependencies
+├── requirements-gpu.txt      # GPU-specific dependencies
 │
 ├── preprocessing/            # Data preprocessing
 │   ├── __init__.py
@@ -65,14 +76,28 @@ RecommenderSystem/
 ### 1. Install Dependencies
 
 ```bash
+# Basic installation (CPU)
 pip install -r requirements.txt
+
+# GPU installation (CUDA 11.8)
+pip install -r requirements.txt
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+# Verify GPU setup
+python check_gpu.py
 ```
 
 ### 2. Train Models
 
 ```bash
-# Full training (may take 10-30 minutes depending on data size)
+# Full training with GPU (auto-detected)
 python train.py
+
+# Force CPU mode
+python train.py --force-cpu
+
+# Use PyTorch for Matrix Factorization (GPU accelerated)
+python train.py --torch-svd
 
 # Quick training (skip SBERT for faster training)
 python train.py --skip-sbert

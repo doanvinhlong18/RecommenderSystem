@@ -4,14 +4,20 @@ numpy>=1.24.0
 scipy>=1.10.0
 scikit-learn>=1.3.0
 
+# Deep Learning / GPU Support
+torch>=2.0.0  # PyTorch for GPU training
+# For CUDA GPU support, install: pip install torch --index-url https://download.pytorch.org/whl/cu118
+
 # NLP and embeddings
 sentence-transformers>=2.2.0
 
 # Matrix factorization and implicit feedback
 implicit>=0.7.0
+# For GPU support: pip install implicit[gpu]
 
 # Similarity search
 faiss-cpu>=1.7.0
+# For GPU support: pip install faiss-gpu (requires CUDA)
 
 # API
 fastapi>=0.100.0

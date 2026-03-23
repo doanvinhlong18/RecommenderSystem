@@ -1,5 +1,7 @@
 """
 Content-Based Recommender using TF-IDF and Sentence-BERT.
+
+GPU-accelerated version with FAISS GPU support.
 """
 import numpy as np
 import pandas as pd
@@ -13,6 +15,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from config import MODELS_DIR, model_config
+from device_config import (
+    get_device, is_gpu_available, get_optimal_batch_size,
+    get_faiss_gpu_resources, faiss_index_to_gpu, log_gpu_memory
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +27,8 @@ logger = logging.getLogger(__name__)
 class ContentBasedRecommender:
     """
     Content-based recommendation using TF-IDF and Sentence-BERT.
+
+    GPU-accelerated with FAISS GPU and SBERT GPU support.
 
     Computes anime-to-anime similarity based on:
     - Genre information
@@ -33,10 +41,17 @@ class ContentBasedRecommender:
         tfidf_matrix: TF-IDF feature matrix
         sbert_embeddings: SBERT embeddings (optional)
         faiss_index: FAISS index for fast similarity search
+        device: Device for computation ("cuda" or "cpu")
     """
 
-    def __init__(self):
-        """Initialize ContentBasedRecommender."""
+    def __init__(self, device: str = None):
+        """
+        Initialize ContentBasedRecommender.
+
+        Args:
+            device: Device for computation ("cuda" or "cpu"). Auto-detected if None.
+        """
+        self.device = device or get_device()
         self.anime_df: Optional[pd.DataFrame] = None
         self.tfidf_vectorizer: Optional[TfidfVectorizer] = None
         self.tfidf_matrix = None
@@ -45,10 +60,16 @@ class ContentBasedRecommender:
         self.faiss_index = None
         self.faiss_index_sbert = None
 
+        # GPU resources for FAISS
+        self._faiss_gpu_resources = None
+        self._use_faiss_gpu = False
+
         # Mappings
         self._id_to_idx: Dict[int, int] = {}
         self._idx_to_id: Dict[int, int] = {}
         self._name_to_idx: Dict[str, int] = {}
+
+        logger.info(f"ContentBasedRecommender initialized with device: {self.device}")
 
     def fit(
         self,
@@ -170,7 +191,7 @@ class ContentBasedRecommender:
 
     def _fit_sbert(self, texts: List[str]) -> None:
         """
-        Generate Sentence-BERT embeddings.
+        Generate Sentence-BERT embeddings with GPU support.
 
         Args:
             texts: List of text documents
@@ -182,25 +203,48 @@ class ContentBasedRecommender:
             return
 
         logger.info(f"Loading SBERT model: {model_config.sbert_model_name}...")
-        self.sbert_model = SentenceTransformer(model_config.sbert_model_name)
+        logger.info(f"SBERT running on {self.device.upper()}")
 
-        logger.info(f"Encoding {len(texts)} texts with SBERT...")
+        # Load SBERT model on specified device
+        self.sbert_model = SentenceTransformer(
+            model_config.sbert_model_name,
+            device=self.device
+        )
+
+        # Get optimal batch size based on device
+        batch_size = get_optimal_batch_size("sbert")
+        logger.info(f"Encoding {len(texts)} texts with SBERT (batch_size={batch_size})...")
+
+        # Log GPU memory before encoding
+        log_gpu_memory("Before SBERT encoding: ")
+
         self.sbert_embeddings = self.sbert_model.encode(
             texts,
-            batch_size=32,
+            batch_size=batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
             normalize_embeddings=True
         )
+
+        # Log GPU memory after encoding
+        log_gpu_memory("After SBERT encoding: ")
+
         logger.info(f"SBERT embeddings shape: {self.sbert_embeddings.shape}")
 
     def _build_faiss_index(self) -> None:
-        """Build FAISS index for fast similarity search."""
+        """Build FAISS index for fast similarity search with GPU support."""
         try:
             import faiss
         except ImportError:
             logger.warning("FAISS not installed. Using sklearn cosine similarity.")
             return
+
+        # Try to get FAISS GPU resources
+        self._faiss_gpu_resources, self._use_faiss_gpu = get_faiss_gpu_resources()
+        if self._use_faiss_gpu:
+            logger.info("FAISS GPU enabled")
+        else:
+            logger.info("FAISS running on CPU")
 
         # Build index for SBERT embeddings (preferred)
         if self.sbert_embeddings is not None:
@@ -211,13 +255,19 @@ class ContentBasedRecommender:
             if len(self.sbert_embeddings) > 10000:
                 nlist = min(model_config.faiss_nlist, len(self.sbert_embeddings) // 100)
                 quantizer = faiss.IndexFlatIP(d)
-                self.faiss_index_sbert = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
-                self.faiss_index_sbert.train(self.sbert_embeddings.astype(np.float32))
-                self.faiss_index_sbert.add(self.sbert_embeddings.astype(np.float32))
-                self.faiss_index_sbert.nprobe = model_config.faiss_nprobe
+                index_sbert = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+                index_sbert.train(self.sbert_embeddings.astype(np.float32))
+                index_sbert.add(self.sbert_embeddings.astype(np.float32))
+                index_sbert.nprobe = model_config.faiss_nprobe
             else:
-                self.faiss_index_sbert = faiss.IndexFlatIP(d)
-                self.faiss_index_sbert.add(self.sbert_embeddings.astype(np.float32))
+                index_sbert = faiss.IndexFlatIP(d)
+                index_sbert.add(self.sbert_embeddings.astype(np.float32))
+
+            # Move to GPU if available
+            if self._use_faiss_gpu:
+                self.faiss_index_sbert = faiss_index_to_gpu(index_sbert, self._faiss_gpu_resources)
+            else:
+                self.faiss_index_sbert = index_sbert
 
             logger.info(f"FAISS SBERT index built with {self.faiss_index_sbert.ntotal} vectors")
 
@@ -231,8 +281,14 @@ class ContentBasedRecommender:
             tfidf_dense = tfidf_dense / norms
 
             d = tfidf_dense.shape[1]
-            self.faiss_index = faiss.IndexFlatIP(d)
-            self.faiss_index.add(tfidf_dense)
+            index_tfidf = faiss.IndexFlatIP(d)
+            index_tfidf.add(tfidf_dense)
+
+            # Move to GPU if available
+            if self._use_faiss_gpu:
+                self.faiss_index = faiss_index_to_gpu(index_tfidf, self._faiss_gpu_resources)
+            else:
+                self.faiss_index = index_tfidf
 
             logger.info(f"FAISS TF-IDF index built with {self.faiss_index.ntotal} vectors")
 

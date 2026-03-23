@@ -1,14 +1,18 @@
 """
 Training script for the Hybrid Anime Recommendation System.
 
+GPU-accelerated version with automatic device detection.
+
 This script trains all recommendation models:
-1. Content-Based (TF-IDF + SBERT)
-2. Collaborative Filtering (Item-Based CF + Matrix Factorization)
-3. Implicit Feedback (ALS)
+1. Content-Based (TF-IDF + SBERT) - GPU accelerated
+2. Collaborative Filtering (Item-Based CF + Matrix Factorization) - GPU with PyTorch
+3. Implicit Feedback (ALS) - GPU with implicit library
 4. Popularity-Based
 
 Usage:
     python train.py [--skip-sbert] [--skip-collaborative] [--skip-implicit] [--sample-size SIZE]
+    python train.py --force-cpu  # Force CPU mode
+    python train.py --torch-svd  # Use PyTorch for Matrix Factorization
 """
 import argparse
 import logging
@@ -19,6 +23,7 @@ import sys
 sys.path.append(str(Path(__file__).parent))
 
 from config import MODELS_DIR, data_config, model_config
+from device_config import init_device, get_device, log_gpu_memory, clear_gpu_cache
 from preprocessing import DataLoader, MatrixBuilder
 from models.content import ContentBasedRecommender
 from models.collaborative import ItemBasedCF, MatrixFactorization
@@ -35,20 +40,23 @@ logger = logging.getLogger(__name__)
 
 def train_content_model(
     anime_df,
-    use_sbert: bool = True
+    use_sbert: bool = True,
+    device: str = None
 ) -> ContentBasedRecommender:
-    """Train content-based model."""
+    """Train content-based model with GPU support."""
     logger.info("=" * 50)
     logger.info("Training Content-Based Model")
     logger.info("=" * 50)
 
     start_time = time.time()
 
-    model = ContentBasedRecommender()
+    device = device or get_device()
+    model = ContentBasedRecommender(device=device)
     model.fit(anime_df, use_tfidf=True, use_sbert=use_sbert, use_faiss=True)
 
     elapsed = time.time() - start_time
     logger.info(f"Content-Based Model trained in {elapsed:.2f} seconds")
+    log_gpu_memory("After Content-Based training: ")
 
     return model
 
@@ -59,19 +67,24 @@ def train_collaborative_model(
     idx_to_anime,
     user_to_idx,
     idx_to_user,
-    method: str = "svd"
+    method: str = "svd",
+    device: str = None,
+    use_torch: bool = False
 ) -> MatrixFactorization:
-    """Train collaborative filtering model."""
+    """Train collaborative filtering model with GPU support."""
     logger.info("=" * 50)
     logger.info(f"Training Collaborative Filtering Model ({method.upper()})")
     logger.info("=" * 50)
 
     start_time = time.time()
 
+    device = device or get_device()
     model = MatrixFactorization(
         n_factors=model_config.svd_factors,
         n_epochs=model_config.svd_epochs,
-        method=method
+        method=method,
+        device=device,
+        use_torch=use_torch
     )
     model.fit(
         user_item_matrix,
@@ -83,6 +96,7 @@ def train_collaborative_model(
 
     elapsed = time.time() - start_time
     logger.info(f"Collaborative Model trained in {elapsed:.2f} seconds")
+    log_gpu_memory("After Collaborative training: ")
 
     return model
 
@@ -122,19 +136,22 @@ def train_implicit_model(
     anime_to_idx,
     idx_to_anime,
     user_to_idx,
-    idx_to_user
+    idx_to_user,
+    device: str = None
 ) -> ALSImplicit:
-    """Train implicit feedback model."""
+    """Train implicit feedback model with GPU support."""
     logger.info("=" * 50)
     logger.info("Training Implicit Feedback Model (ALS)")
     logger.info("=" * 50)
 
     start_time = time.time()
 
+    device = device or get_device()
     model = ALSImplicit(
         n_factors=model_config.implicit_factors,
         n_iterations=model_config.implicit_iterations,
-        regularization=model_config.implicit_regularization
+        regularization=model_config.implicit_regularization,
+        device=device
     )
     model.fit(
         implicit_matrix,
@@ -146,6 +163,7 @@ def train_implicit_model(
 
     elapsed = time.time() - start_time
     logger.info(f"Implicit Model trained in {elapsed:.2f} seconds")
+    log_gpu_memory("After Implicit training: ")
 
     return model
 
@@ -177,11 +195,25 @@ def main():
     parser.add_argument("--skip-collaborative", action="store_true", help="Skip collaborative filtering")
     parser.add_argument("--skip-implicit", action="store_true", help="Skip implicit feedback model")
     parser.add_argument("--sample-size", type=int, default=None, help="Sample size for ratings")
-    parser.add_argument("--cf-method", type=str, default="svd", choices=["svd", "als"], help="CF method")
+    parser.add_argument("--cf-method", type=str, default="svd", choices=["svd", "als", "torch"], help="CF method")
+    parser.add_argument("--force-cpu", action="store_true", help="Force CPU mode even if GPU is available")
+    parser.add_argument("--torch-svd", action="store_true", help="Use PyTorch for Matrix Factorization")
 
     args = parser.parse_args()
 
     total_start = time.time()
+
+    # ===== INITIALIZE DEVICE =====
+    logger.info("=" * 50)
+    logger.info("Initializing Device")
+    logger.info("=" * 50)
+
+    device = init_device(force_cpu=args.force_cpu)
+
+    if device == "cuda":
+        logger.info("🚀 GPU acceleration enabled!")
+    else:
+        logger.info("Running in CPU fallback mode")
 
     # Update config if sample size provided
     if args.sample_size:
@@ -219,7 +251,7 @@ def main():
     # ===== TRAIN MODELS =====
 
     # 1. Content-Based
-    content_model = train_content_model(anime_df, use_sbert=not args.skip_sbert)
+    content_model = train_content_model(anime_df, use_sbert=not args.skip_sbert, device=device)
 
     # 2. Collaborative Filtering
     if not args.skip_collaborative:
@@ -229,7 +261,9 @@ def main():
             matrix_builder.idx_to_anime,
             matrix_builder.user_to_idx,
             matrix_builder.idx_to_user,
-            method=args.cf_method
+            method=args.cf_method,
+            device=device,
+            use_torch=args.torch_svd
         )
     else:
         collaborative_model = None
@@ -242,7 +276,8 @@ def main():
             matrix_builder.anime_to_idx,
             matrix_builder.idx_to_anime,
             matrix_builder.user_to_idx,
-            matrix_builder.idx_to_user
+            matrix_builder.idx_to_user,
+            device=device
         )
     else:
         implicit_model = None
