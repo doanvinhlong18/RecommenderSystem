@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "format": "csv_split",
+  "random_state": 42,
+  "test_ratio": 0.2,
+  "relevance_threshold": 7.0,
+  "leave_one_out": false,
+  "min_train_items": 10,
+  "min_test_items": 3,
+  "source_rows": 57633278,
+  "eval_users": 276772,
+  "train_interactions": 48695969,
+  "test_interactions": 8755549,
+  "train_csv": "saved_models\\full_collab_split\\train_ratings.csv",
+  "test_csv": "saved_models\\full_collab_split\\test_ratings.csv"
+}

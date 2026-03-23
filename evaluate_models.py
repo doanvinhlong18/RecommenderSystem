@@ -8,14 +8,11 @@ Evaluates each model separately:
 - Popularity-Based
 - Hybrid Engine (Combined)
 
-FIXES APPLIED:
-1. Train/Test split now keeps ALL interactions in train, only relevant items in test
-2. Content-Based evaluation uses multiple items to build user profile
-3. Implicit ALS evaluation uses correct index mapping
-4. Hybrid evaluation uses consistent ID space
-
 Usage:
     python evaluate_models.py [--sample-users 500] [--k 5 10 20] [--output results.json]
+
+This script no longer creates a fresh split. It loads the persisted split
+artifact created before training and evaluates every model on that same hold-out.
 """
 import argparse
 import json
@@ -31,7 +28,8 @@ import pandas as pd
 import sys
 sys.path.append(str(Path(__file__).parent))
 
-from config import MODELS_DIR
+from config import MODELS_DIR, SPLITS_DIR, eval_config
+from preprocessing import load_ratings_user_split
 from models.content import ContentBasedRecommender
 from models.collaborative import MatrixFactorization
 from models.implicit import ALSImplicit
@@ -583,7 +581,9 @@ def evaluate_collaborative_model(
 
             recommendations = collab_model.recommend_for_user(
                 user_id,
-                top_k=max(k_values) + len(train_items)  # Get extra to filter
+                top_k=max(k_values) + len(train_items),  # Get extra to filter
+                exclude_rated=True,
+                rated_items=set(train_items.keys()),
             )
 
             if not recommendations:
@@ -630,27 +630,16 @@ def evaluate_collaborative_model(
 
 def evaluate_implicit_model(
     implicit_model: ALSImplicit,
-    ratings_df: pd.DataFrame,
+    user_train: Dict[int, Dict[int, float]],
+    user_test: Dict[int, Set[int]],
+    eval_users: List[int],
     k_values: List[int],
     max_users: int = 500
 ) -> Dict[str, Dict[str, float]]:
     """
-    Evaluate Implicit Feedback Model (ALS) - FIXED FOR IMPLICIT FEEDBACK.
-
-    KEY FIXES:
-    1. Use model's own user_to_idx and anime_to_idx mappings
-    2. Ground truth = ANY interaction in test set (binary relevance, no threshold)
-    3. Explicit bounds checking before accessing model factors
-    4. Proper index conversion: user_id -> user_idx, item_idx -> anime_id
-    5. Never silently skip - log all skip reasons
-    6. Uses separate data preparation for implicit feedback
-
-    For implicit feedback:
-    - We don't use rating threshold (all interactions are "positive")
-    - Ground truth = items the user interacted with in test set
-    - Metrics: HitRate, Recall, NDCG are most meaningful
+    Evaluate the implicit model against the single persisted split.
     """
-    logger.info("Evaluating Implicit Feedback Model (FIXED for implicit feedback)...")
+    logger.info("Evaluating Implicit Feedback Model using the persisted split...")
 
     if implicit_model is None:
         logger.warning("Implicit model not available")
@@ -671,16 +660,7 @@ def evaluate_implicit_model(
     logger.info(f"  Model dimensions: {n_model_users} users x {n_model_items} items")
     logger.info(f"  Mappings: {len(implicit_model.user_to_idx)} users, {len(implicit_model.anime_to_idx)} items")
 
-    # Prepare implicit-specific evaluation data
-    implicit_train, implicit_test, implicit_users = prepare_implicit_evaluation_data(
-        ratings_df,
-        implicit_model,
-        min_train_items=5,
-        min_test_items=1,
-        test_ratio=0.2
-    )
-
-    if not implicit_users:
+    if not eval_users:
         logger.error("No users available for implicit evaluation")
         return {}
 
@@ -696,12 +676,12 @@ def evaluate_implicit_model(
     }
 
     # Sample users
-    sample_users = implicit_users[:max_users] if len(implicit_users) > max_users else implicit_users
+    sample_users = eval_users[:max_users] if len(eval_users) > max_users else eval_users
     logger.info(f"  Evaluating {len(sample_users)} users")
 
     for i, user_id in enumerate(sample_users):
-        train_items = implicit_train.get(user_id, set())
-        test_items = implicit_test.get(user_id, set())
+        train_items = set(user_train.get(user_id, {}).keys())
+        test_items = user_test.get(user_id, set())
 
         if not test_items:
             skip_reasons['no_test_items'] += 1
@@ -905,6 +885,13 @@ def evaluate_hybrid_model(
             continue
 
         try:
+            # Ensure the hybrid engine only sees the user's training history.
+            hybrid_engine.set_user_history(
+                user_id,
+                ratings=train_items,
+                watched=set(train_items.keys()),
+            )
+
             # Get recommendations with exclude_watched=True
             recommendations = hybrid_engine.recommend_for_user(
                 user_id,
@@ -1057,9 +1044,12 @@ def main():
     parser.add_argument("--skip-implicit", action="store_true", help="Skip implicit model evaluation")
     parser.add_argument("--skip-popularity", action="store_true", help="Skip popularity model evaluation")
     parser.add_argument("--skip-hybrid", action="store_true", help="Skip hybrid model evaluation")
-    parser.add_argument("--rating-sample", type=int, default=1000000, help="Number of ratings to sample")
-    parser.add_argument("--leave-one-out", action="store_true", help="Use Leave-One-Out evaluation")
-    parser.add_argument("--relevance-threshold", type=float, default=7.0, help="Rating threshold for relevance")
+    parser.add_argument(
+        "--split-path",
+        type=str,
+        default=str(SPLITS_DIR / "ratings_user_split.pkl"),
+        help="Path to the persisted train/eval split artifact created before training",
+    )
 
     args = parser.parse_args()
 
@@ -1069,10 +1059,10 @@ def main():
     print("ANIME RECOMMENDATION MODELS - EVALUATION (FIXED)")
     print("=" * 60)
     print("\nFIXES APPLIED:")
-    print("  1. Train/Test split keeps ALL interactions in train")
-    print("  2. Content-Based uses multi-item user profile")
-    print("  3. Implicit ALS uses correct index mapping")
-    print("  4. Hybrid uses consistent ID space")
+    print("  1. A single persisted split is created before training")
+    print("  2. Models only train on user_train interactions")
+    print("  3. Evaluation only measures held-out user_test interactions")
+    print("  4. All models share the exact same split artifact")
     print("=" * 60)
 
     # =========================================================================
@@ -1131,34 +1121,29 @@ def main():
             print(f"  [SKIP] Hybrid Engine: {e}")
 
     # =========================================================================
-    # Load Data
+    # Load Split
     # =========================================================================
-    print("\n[2/3] Loading Evaluation Data...")
+    print("\n[2/3] Loading Persisted Split...")
     print("-" * 40)
 
-    try:
-        ratings_df = load_ratings_for_evaluation(args.rating_sample)
-        print(f"  Ratings loaded: {len(ratings_df):,} records")
-    except Exception as e:
-        print(f"  Error loading ratings: {e}")
-        print("  Trying with smaller sample...")
-        ratings_df = load_ratings_for_evaluation(500000)
-        print(f"  Ratings loaded: {len(ratings_df):,} records")
-
-    # Prepare train/test split with FIXED logic
-    user_train, user_test, eval_users = prepare_evaluation_data(
-        ratings_df,
-        relevance_threshold=args.relevance_threshold,
-        leave_one_out=args.leave_one_out
-    )
+    split_path = Path(args.split_path)
+    split_artifact = load_ratings_user_split(split_path)
+    user_train = split_artifact.user_train
+    user_test = split_artifact.user_test
+    eval_users = list(split_artifact.eval_users)
 
     # Sample users
     if len(eval_users) > args.sample_users:
-        eval_users = list(np.random.choice(eval_users, args.sample_users, replace=False))
+        random_state = int(split_artifact.metadata.get("random_state", eval_config.random_state))
+        rng = np.random.default_rng(random_state)
+        eval_users = list(rng.choice(eval_users, args.sample_users, replace=False))
 
+    print(f"  Split path: {split_path}")
+    print(f"  Train interactions: {split_artifact.metadata.get('train_interactions', 'N/A')}")
+    print(f"  Test interactions: {split_artifact.metadata.get('test_interactions', 'N/A')}")
     print(f"  Evaluation users: {len(eval_users)}")
     print(f"  K values: {args.k}")
-    print(f"  Leave-One-Out: {args.leave_one_out}")
+    print(f"  Split seed: {split_artifact.metadata.get('random_state', eval_config.random_state)}")
 
     # =========================================================================
     # Evaluate Models
@@ -1184,9 +1169,8 @@ def main():
 
     if implicit_model is not None:
         start = time.time()
-        # Implicit uses its own data preparation (no rating threshold)
         all_results['Implicit'] = evaluate_implicit_model(
-            implicit_model, ratings_df, args.k, args.sample_users
+            implicit_model, user_train, user_test, eval_users, args.k, args.sample_users
         )
         print(f"  Implicit evaluation time: {time.time() - start:.1f}s")
 
@@ -1239,14 +1223,14 @@ def main():
         'config': {
             'sample_users': args.sample_users,
             'k_values': args.k,
-            'leave_one_out': args.leave_one_out,
-            'relevance_threshold': args.relevance_threshold
+            'split_path': str(split_path),
+            'split_metadata': split_artifact.metadata,
         },
         'fixes_applied': [
-            'Train/Test split keeps ALL interactions in train',
-            'Content-Based uses multi-item user profile',
-            'Implicit ALS uses correct index mapping',
-            'Hybrid uses consistent ID space'
+            'Single persisted split created before training',
+            'Training uses only user_train interactions',
+            'Evaluation measures only user_test interactions',
+            'All evaluated models share the same split artifact',
         ],
         'results': all_results,
         'total_time': f"{total_time:.2f}s"

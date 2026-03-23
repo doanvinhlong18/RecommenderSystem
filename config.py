@@ -12,13 +12,17 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 MODELS_DIR = BASE_DIR / "saved_models"
 CACHE_DIR = BASE_DIR / "cache"
+SPLITS_DIR = MODELS_DIR / "splits"
 
 # Dataset paths
-DATASET_PATH = BASE_DIR / "data"
+DATASET_PATH = DATA_DIR
+DEFAULT_DATASET_SUBDIR = DATA_DIR / "anime-recommendation-database-2020"
+if DEFAULT_DATASET_SUBDIR.exists():
+    DATASET_PATH = DEFAULT_DATASET_SUBDIR
 
 
 # Create directories if they don't exist
-for dir_path in [DATA_DIR, MODELS_DIR, CACHE_DIR]:
+for dir_path in [DATA_DIR, MODELS_DIR, CACHE_DIR, SPLITS_DIR]:
     dir_path.mkdir(exist_ok=True)
 
 
@@ -55,6 +59,16 @@ class ModelConfig:
     svd_epochs: int = 20
     svd_lr: float = 0.005
     svd_reg: float = 0.02
+
+    # BPR collaborative settings
+    bpr_factors: int = 50
+    bpr_iterations: int = 30
+    bpr_learning_rate: float = 0.05
+    bpr_regularization: float = 0.01
+    bpr_positive_rating_threshold: float = 7.0
+    bpr_verify_negative_samples: bool = True
+    bpr_use_implicit_signal: bool = True
+    bpr_warm_start_from_als: bool = True
 
     # ALS settings
     als_factors: int = 50
