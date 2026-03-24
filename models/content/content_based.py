@@ -100,63 +100,23 @@ class ContentBasedRecommender:
         self,
         user_ratings: Dict[int, float],
         all_ratings: Dict[int, float] = None,
-        positive_percentile: float = 75.0,
+        positive_percentile: float = 50.0,
         negative_percentile: float = 25.0,
         negative_weight: float = 0.4,
     ) -> np.ndarray:
-        """
-        Build normalized user vector từ anime ratings.
 
-        Ngưỡng positive/negative được tính theo percentile của chính user,
-        thay vì hardcode — adaptive với từng user có rating pattern khác nhau.
-
-        Ví dụ user chỉ rate 6-8:
-          positive_percentile=75 → ngưỡng ~7.5  (top 25% ratings của user)
-          negative_percentile=25 → ngưỡng ~6.5  (bottom 25% ratings của user)
-
-        Positive weighting:  rating - pos_threshold  (càng cao hơn ngưỡng → weight lớn)
-        Negative weighting:  neg_threshold - rating  (càng thấp hơn ngưỡng → weight lớn)
-        → Cả hai đều dùng khoảng cách từ ngưỡng, symmetric.
-
-        Args:
-            user_ratings:        {item_id: rating} dùng để build positive vector
-                                 (thường là train items trong evaluation)
-            all_ratings:         {item_id: rating} toàn bộ ratings của user,
-                                 dùng để tính percentile và lấy negative signal.
-                                 Nếu None thì fallback về user_ratings.
-            positive_percentile: Percentile để tính pos_threshold (default 75.0)
-                                 Items có rating >= percentile này → liked
-            negative_percentile: Percentile để tính neg_threshold (default 25.0)
-                                 Items có rating <= percentile này → disliked
-            negative_weight:     Mức độ trừ negative vector (default 0.4)
-
-        Returns:
-            Normalized user vector (np.float32), hoặc None nếu không có liked items.
-        """
         source_ratings = all_ratings if all_ratings is not None else user_ratings
 
-        # ── Tính ngưỡng theo percentile của user ─────────────────────────────
+        # ── Compute thresholds ─────────────────────────────────────────────
         all_rating_vals = np.array(list(source_ratings.values()), dtype=np.float32)
+
+        if len(all_rating_vals) == 0:
+            return None
 
         pos_threshold = float(np.percentile(all_rating_vals, positive_percentile))
         neg_threshold = float(np.percentile(all_rating_vals, negative_percentile))
 
-        # Edge case: nếu toàn bộ rating bằng nhau thì không có signal
-        # → dùng vector trung bình đơn giản
-        if pos_threshold == neg_threshold:
-            indices = [
-                self._id_to_idx[i]
-                for i in user_ratings
-                if self._id_to_idx.get(i) is not None
-            ]
-            if not indices:
-                return None
-            vec = self.embeddings[indices].mean(axis=0).astype(np.float32)
-            norm = np.linalg.norm(vec)
-            return (vec / norm) if norm > 0 else vec
-
-        # ── Positive vector ───────────────────────────────────────────────────
-        # Dùng user_ratings (train items) để tránh leak test item
+        # ── Positive vector ────────────────────────────────────────────────
         pos_indices = []
         pos_weights = []
 
@@ -166,53 +126,47 @@ class ContentBasedRecommender:
             idx = self._id_to_idx.get(item_id)
             if idx is None:
                 continue
+
             pos_indices.append(idx)
-            # Khoảng cách trên ngưỡng → weight (đối xứng với negative)
-            pos_weights.append(rating - pos_threshold)
+            pos_weights.append(rating - pos_threshold + 1.0)
 
         if not pos_indices:
             return None
 
         pos_vecs = self.embeddings[pos_indices]
         pos_w = np.array(pos_weights, dtype=np.float32)
-        pos_w = np.maximum(pos_w, 1e-6)  # tránh zero weight khi đúng bằng ngưỡng
-        pos_vector = np.average(pos_vecs, axis=0, weights=pos_w)
-        pos_norm = np.linalg.norm(pos_vector)
-        if pos_norm > 0:
-            pos_vector /= pos_norm
 
-        # ── Negative vector ───────────────────────────────────────────────────
-        # Dùng source_ratings (all_ratings) để lấy đủ dislike signal
-        # Không gây data leak: disliked items (bottom percentile) rất khó trùng
-        # test item (top percentile) khi pos_threshold != neg_threshold
+        pos_vector = np.average(pos_vecs, axis=0, weights=pos_w)
+
+        # ── Negative vector ────────────────────────────────────────────────
         neg_indices = []
         neg_weights = []
 
         for item_id, rating in source_ratings.items():
-            if rating > neg_threshold:
+            if rating >= min(neg_threshold, 7):
                 continue
             idx = self._id_to_idx.get(item_id)
             if idx is None:
                 continue
-            neg_indices.append(idx)
-            # Khoảng cách dưới ngưỡng → weight (đối xứng với positive)
-            neg_weights.append(neg_threshold - rating)
 
-        user_vector = pos_vector  # default nếu không có negative signal
+            neg_indices.append(idx)
+            neg_weights.append(neg_threshold - rating + 1.0)
+
+        # ── Combine ───────────────────────────────────────────────────────
+        user_vector = pos_vector
 
         if neg_indices:
             neg_vecs = self.embeddings[neg_indices]
             neg_w = np.array(neg_weights, dtype=np.float32)
-            neg_w = np.maximum(neg_w, 1e-6)
+
             neg_vector = np.average(neg_vecs, axis=0, weights=neg_w)
-            neg_norm = np.linalg.norm(neg_vector)
-            if neg_norm > 0:
-                neg_vector /= neg_norm
 
             user_vector = pos_vector - negative_weight * neg_vector
-            u_norm = np.linalg.norm(user_vector)
-            if u_norm > 0:
-                user_vector /= u_norm
+
+        # ── Final normalize (IMPORTANT) ────────────────────────────────────
+        norm = np.linalg.norm(user_vector)
+        if norm > 0:
+            user_vector = user_vector / norm
 
         return user_vector.astype(np.float32)
 

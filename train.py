@@ -4,7 +4,7 @@ Training script for the Hybrid Anime Recommendation System.
 GPU-accelerated version with automatic device detection.
 
 This script trains all recommendation models:
-1. Content-Based (TF-IDF + SBERT) - GPU accelerated
+1. Content-Based (SBERT + Structured Features) - GPU accelerated
 2. Collaborative Filtering (Item-Based CF + Matrix Factorization) - GPU with PyTorch
 3. Implicit Feedback (ALS) - GPU with implicit library
 4. Popularity-Based
@@ -12,29 +12,35 @@ This script trains all recommendation models:
 Usage:
     python train.py [--skip-sbert] [--skip-collaborative] [--skip-implicit] [--sample-size SIZE]
     python train.py --force-cpu  # Force CPU mode
-    python train.py --torch-svd  # Use PyTorch for Matrix Factorization
 """
+
 import argparse
 import logging
 import time
 from pathlib import Path
 
+# [CHANGED] import numpy ở top-level thay vì import cục bộ bên trong hàm
+import numpy as np
+
 import sys
+
 sys.path.append(str(Path(__file__).parent))
 
 from config import MODELS_DIR, SPLITS_DIR, data_config, eval_config, model_config
+
+# [CHANGED] gộp hai khối preprocessing import thành một, thêm TextProcessor + ContentFeatureBuilder
 from preprocessing import (
     DataLoader,
     MatrixBuilder,
+    TextProcessor,
+    ContentFeatureBuilder,
     create_ratings_user_split,
     filter_holdout_interactions,
     load_ratings_user_split,
     save_ratings_user_split,
     split_to_ratings_df,
 )
-from config import MODELS_DIR, data_config, model_config
 from device_config import init_device, get_device, log_gpu_memory, clear_gpu_cache
-from preprocessing import DataLoader, MatrixBuilder
 from models.content import ContentBasedRecommender
 from models.collaborative import ItemBasedCF, MatrixFactorization
 from models.implicit import ALSImplicit
@@ -42,18 +48,28 @@ from models.popularity import PopularityModel
 from models.hybrid import HybridEngine
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
 
+# [CHANGED] Toàn bộ body hàm được thay thế bằng pipeline từ train_content.py,
+# đồng thời giữ lại tham số `device` của train.py
 def train_content_model(
-    anime_df,
-    use_sbert: bool = True,
-    device: str = None
+    anime_df, use_sbert: bool = True, device: str = None
 ) -> ContentBasedRecommender:
-    """Train content-based model with GPU support."""
+    """
+    Train content-based model: SBERT + structured features → fused embedding.
+
+    Args:
+        anime_df: DataFrame với anime metadata — phải có cột 'year'.
+                  Dùng loader.get_content_base_dataframe() để đảm bảo điều này.
+        use_sbert: Có dùng SBERT embeddings không (False = structured only).
+        device: Thiết bị tính toán ('cuda' hoặc 'cpu').
+
+    Returns:
+        Trained ContentBasedRecommender model
+    """
     logger.info("=" * 50)
     logger.info("Training Content-Based Model")
     logger.info("=" * 50)
@@ -61,11 +77,51 @@ def train_content_model(
     start_time = time.time()
 
     device = device or get_device()
+
+    # Step 1: Generate text embeddings
+    processor = TextProcessor()
+
+    if use_sbert:
+        logger.info("Step 1: Generating SBERT embeddings...")
+        combined_text = processor.combine_text_features(anime_df)
+        sbert_emb = processor.fit_sbert(
+            combined_text, anime_ids=anime_df["MAL_ID"].tolist()
+        )
+        logger.info(f"  SBERT embeddings shape: {sbert_emb.shape}")
+    else:
+        logger.warning("Step 1: Skipping SBERT — using zero embeddings")
+        sbert_emb = np.zeros((len(anime_df), 384), dtype=np.float32)
+
+    # Step 2: Build structured features + fusion
+    logger.info("Step 2: Building structured features...")
+    builder = ContentFeatureBuilder()
+    builder.fit(anime_df)
+
+    if use_sbert:
+        w_struct, w_text, w_tmp = 0.3, 0.55, 0.15
+        logger.info(
+            f"  Fusing SBERT ({w_text*100:.0f}%) "
+            f"+ Structured ({w_struct*100:.0f}%) "
+            f"+ Member ({w_tmp*100:.0f}%)..."
+        )
+        final_emb = builder.transform(
+            anime_df, sbert_emb, w_struct=w_struct, w_text=w_text, w_tmp=w_tmp
+        )
+    else:
+        logger.info("  Using structured features only...")
+        final_emb = builder.transform(
+            anime_df, sbert_emb, w_struct=0.5, w_text=0.0, w_tmp=0.5
+        )
+
+    logger.info(f"  Final embedding shape: {final_emb.shape}")
+
+    # Step 3: Fit recommender
+    logger.info("Step 3: Fitting ContentBasedRecommender...")
     model = ContentBasedRecommender(device=device)
-    model.fit(anime_df, use_tfidf=True, use_sbert=use_sbert, use_faiss=True)
+    model.fit(anime_df, final_emb)
 
     elapsed = time.time() - start_time
-    logger.info(f"Content-Based Model trained in {elapsed:.2f} seconds")
+    logger.info(f"✓ Content-Based Model trained in {elapsed:.2f}s")
     log_gpu_memory("After Content-Based training: ")
 
     return model
@@ -128,11 +184,7 @@ def train_collaborative_model(
 
 
 def train_item_based_cf(
-    user_item_matrix,
-    anime_to_idx,
-    idx_to_anime,
-    user_to_idx,
-    idx_to_user
+    user_item_matrix, anime_to_idx, idx_to_anime, user_to_idx, idx_to_user
 ) -> ItemBasedCF:
     """Train item-based collaborative filtering model."""
     logger.info("=" * 50)
@@ -148,7 +200,7 @@ def train_item_based_cf(
         idx_to_anime,
         user_to_idx,
         idx_to_user,
-        compute_full_similarity=False  # Use FAISS instead
+        compute_full_similarity=False,
     )
 
     elapsed = time.time() - start_time
@@ -163,7 +215,7 @@ def train_implicit_model(
     idx_to_anime,
     user_to_idx,
     idx_to_user,
-    device: str = None
+    device: str = None,
 ) -> ALSImplicit:
     """Train implicit feedback model with GPU support."""
     logger.info("=" * 50)
@@ -177,15 +229,9 @@ def train_implicit_model(
         n_factors=model_config.implicit_factors,
         n_iterations=model_config.implicit_iterations,
         regularization=model_config.implicit_regularization,
-        device=device
+        device=device,
     )
-    model.fit(
-        implicit_matrix,
-        anime_to_idx,
-        idx_to_anime,
-        user_to_idx,
-        idx_to_user
-    )
+    model.fit(implicit_matrix, anime_to_idx, idx_to_anime, user_to_idx, idx_to_user)
 
     elapsed = time.time() - start_time
     logger.info(f"Implicit Model trained in {elapsed:.2f} seconds")
@@ -194,11 +240,7 @@ def train_implicit_model(
     return model
 
 
-def train_popularity_model(
-    anime_df,
-    ratings_df,
-    animelist_df
-) -> PopularityModel:
+def train_popularity_model(anime_df, ratings_df, animelist_df) -> PopularityModel:
     """Train popularity model."""
     logger.info("=" * 50)
     logger.info("Training Popularity Model")
@@ -259,25 +301,66 @@ def load_or_create_training_split(
 
 def main():
     parser = argparse.ArgumentParser(description="Train Anime Recommendation Models")
-    parser.add_argument("--skip-sbert", action="store_true", help="Skip SBERT embeddings")
-    parser.add_argument("--skip-collaborative", action="store_true", help="Skip collaborative filtering")
-    parser.add_argument("--skip-implicit", action="store_true", help="Skip implicit feedback model")
-    parser.add_argument("--sample-size", type=int, default=None, help="Sample size for ratings")
-    parser.add_argument("--cf-method", type=str, default="svd", choices=["svd", "als", "torch"], help="CF method")
-    parser.add_argument("--force-cpu", action="store_true", help="Force CPU mode even if GPU is available")
-    parser.add_argument("--cf-method", type=str, default="bpr", choices=["bpr", "svd", "als"], help="CF method")
+    parser.add_argument(
+        "--skip-sbert", action="store_true", help="Skip SBERT embeddings"
+    )
+    parser.add_argument(
+        "--skip-collaborative", action="store_true", help="Skip collaborative filtering"
+    )
+    parser.add_argument(
+        "--skip-implicit", action="store_true", help="Skip implicit feedback model"
+    )
+    parser.add_argument(
+        "--sample-size", type=int, default=None, help="Sample size for ratings"
+    )
+    # [FIXED] Xoá khai báo --cf-method trùng lặp, giữ lại bản đúng (default="bpr")
+    parser.add_argument(
+        "--cf-method",
+        type=str,
+        default="bpr",
+        choices=["bpr", "svd", "als"],
+        help="CF method",
+    )
+    parser.add_argument(
+        "--force-cpu",
+        action="store_true",
+        help="Force CPU mode even if GPU is available",
+    )
     parser.add_argument(
         "--split-path",
         type=str,
         default=str(SPLITS_DIR / "ratings_user_split.pkl"),
         help="Path to the persisted train/eval split artifact",
     )
-    parser.add_argument("--force-resplit", action="store_true", help="Regenerate the split before training")
-    parser.add_argument("--test-ratio", type=float, default=eval_config.test_size, help="Held-out ratio for the split")
-    parser.add_argument("--relevance-threshold", type=float, default=7.0, help="Minimum rating to be eligible for user_test")
-    parser.add_argument("--min-train-items", type=int, default=10, help="Minimum train items per user after the split")
-    parser.add_argument("--min-test-items", type=int, default=3, help="Minimum test items per user")
-    parser.add_argument("--leave-one-out", action="store_true", help="Create a leave-one-out split")
+    parser.add_argument(
+        "--force-resplit",
+        action="store_true",
+        help="Regenerate the split before training",
+    )
+    parser.add_argument(
+        "--test-ratio",
+        type=float,
+        default=eval_config.test_size,
+        help="Held-out ratio for the split",
+    )
+    parser.add_argument(
+        "--relevance-threshold",
+        type=float,
+        default=7.0,
+        help="Minimum rating to be eligible for user_test",
+    )
+    parser.add_argument(
+        "--min-train-items",
+        type=int,
+        default=10,
+        help="Minimum train items per user after the split",
+    )
+    parser.add_argument(
+        "--min-test-items", type=int, default=3, help="Minimum test items per user"
+    )
+    parser.add_argument(
+        "--leave-one-out", action="store_true", help="Create a leave-one-out split"
+    )
 
     args = parser.parse_args()
 
@@ -308,9 +391,15 @@ def main():
     loader = DataLoader()
     split_path = Path(args.split_path)
 
-    # Load anime data
+    # [CHANGED] Tải riêng hai DataFrame để tránh xung đột cột:
+    # - anime_df: dùng cho PopularityModel, HybridEngine (get_merged_anime_data)
+    # - content_anime_df: dùng riêng cho ContentBasedRecommender, đảm bảo có
+    #   cột 'year' (trích từ 'Aired') mà ContentFeatureBuilder.fit() yêu cầu
     anime_df = loader.get_merged_anime_data()
     logger.info(f"Anime data: {len(anime_df)} records")
+
+    content_anime_df = loader.get_content_base_dataframe()
+    logger.info(f"Content anime data: {len(content_anime_df)} records")
 
     # Create the split once before any model sees interaction data.
     split_artifact, train_ratings_df = load_or_create_training_split(
@@ -333,8 +422,12 @@ def main():
     # Load animelist
     animelist_df = loader.load_animelist(sample=True)
     logger.info(f"Animelist: {len(animelist_df):,} records")
-    train_animelist_df = filter_holdout_interactions(animelist_df, split_artifact.user_test)
-    logger.info(f"Animelist after removing held-out pairs: {len(train_animelist_df):,} records")
+    train_animelist_df = filter_holdout_interactions(
+        animelist_df, split_artifact.user_test
+    )
+    logger.info(
+        f"Animelist after removing held-out pairs: {len(train_animelist_df):,} records"
+    )
 
     # ===== BUILD MATRICES =====
     logger.info("=" * 50)
@@ -348,7 +441,10 @@ def main():
     # ===== TRAIN MODELS =====
 
     # 1. Content-Based
-    content_model = train_content_model(anime_df, use_sbert=not args.skip_sbert, device=device)
+    # [CHANGED] truyền content_anime_df (có cột 'year') thay vì anime_df
+    content_model = train_content_model(
+        content_anime_df, use_sbert=not args.skip_sbert, device=device
+    )
 
     # 2. Implicit Feedback
     if not args.skip_implicit:
@@ -358,7 +454,7 @@ def main():
             matrix_builder.idx_to_anime,
             matrix_builder.user_to_idx,
             matrix_builder.idx_to_user,
-            device=device
+            device=device,
         )
     else:
         implicit_model = None
@@ -382,7 +478,9 @@ def main():
         logger.info("Skipping Collaborative Filtering")
 
     # 4. Popularity
-    popularity_model = train_popularity_model(anime_df, train_ratings_df, train_animelist_df)
+    popularity_model = train_popularity_model(
+        anime_df, train_ratings_df, train_animelist_df
+    )
 
     # ===== CREATE HYBRID ENGINE =====
     logger.info("=" * 50)
@@ -393,7 +491,7 @@ def main():
         content_model=content_model,
         collaborative_model=collaborative_model,
         implicit_model=implicit_model,
-        popularity_model=popularity_model
+        popularity_model=popularity_model,
     )
     hybrid_engine.set_anime_info(anime_df)
 
@@ -410,7 +508,9 @@ def main():
 
     total_elapsed = time.time() - total_start
     logger.info("=" * 50)
-    logger.info(f"Training Complete! Total time: {total_elapsed:.2f} seconds ({total_elapsed/60:.1f} minutes)")
+    logger.info(
+        f"Training Complete! Total time: {total_elapsed:.2f} seconds ({total_elapsed/60:.1f} minutes)"
+    )
     logger.info(f"Models saved to: {save_dir}")
     logger.info("=" * 50)
 
@@ -424,7 +524,9 @@ def main():
     print(f"\nRecommendations similar to '{test_anime}':")
     recs = hybrid_engine.recommend_similar_anime(test_anime, top_k=5)
     for rec in recs:
-        print(f"  - {rec['name']} (Score: {rec['score']}, Hybrid: {rec['hybrid_score']:.4f})")
+        print(
+            f"  - {rec['name']} (Score: {rec['score']}, Hybrid: {rec['hybrid_score']:.4f})"
+        )
 
     # Test user recommendation
     test_user = list(matrix_builder.user_to_idx.keys())[0]
@@ -437,7 +539,9 @@ def main():
     print(f"\nRecommendations for user {test_user}:")
     user_recs = hybrid_engine.recommend_for_user(test_user, top_k=5)
     for rec in user_recs:
-        print(f"  - {rec['name']} (Score: {rec['score']}, Hybrid: {rec['hybrid_score']:.4f})")
+        print(
+            f"  - {rec['name']} (Score: {rec['score']}, Hybrid: {rec['hybrid_score']:.4f})"
+        )
 
     # Test popular
     print("\nTop Rated Anime:")

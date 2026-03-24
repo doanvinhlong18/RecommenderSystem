@@ -77,7 +77,7 @@ def sample_users(df, n_users: int = 1000, seed: int = 42):
 def build_loo_split(
     df,
     users,
-    positive_percentile: float = 75.0,
+    positive_percentile: float = 50.0,
     seed: int = 42,
 ):
     """
@@ -203,7 +203,7 @@ def build_user_matrix(
     model,
     user_train: Dict[int, List[int]],
     rating_map: Dict[int, Dict[int, float]],
-    positive_percentile: float = 75.0,
+    positive_percentile: float = 50.0,
     negative_percentile: float = 25.0,
     negative_weight: float = 0.4,
 ):
@@ -372,9 +372,9 @@ def print_results(results: Dict, k_values: List[int], elapsed: float):
 # ─────────────────────────────────────────
 
 # Định nghĩa từng trục — grid = tích cartesian của 3 mảng
-POSITIVE_PERCENTILES = [75.0, 80.0, 85.0]
-NEGATIVE_PERCENTILES = [25.0, 20.0, 30.0]
-NEGATIVE_WEIGHTS = [0.2, 0.4, 0.3]
+POSITIVE_PERCENTILES = [50, 60.0, 70.0, 80.0]
+NEGATIVE_PERCENTILES = [25.0, 30.0, 35.0]
+NEGATIVE_WEIGHTS = [0.5, 0.4, 0.3]
 
 # Tổng số combos = len(POSITIVE_PERCENTILES) * len(NEGATIVE_PERCENTILES) * len(NEGATIVE_WEIGHTS)
 
@@ -463,7 +463,7 @@ def main(
     k_values: List[int] = [5, 10, 20],
     sample_users_n: int = 1000,
     n_neg: int = 99,
-    seed: int = 42,
+    seed: int = 40,
     positive_percentiles: List[float] = None,  # None = dùng POSITIVE_PERCENTILES
     negative_percentiles: List[float] = None,  # None = dùng NEGATIVE_PERCENTILES
     negative_weights: List[float] = None,  # None = dùng NEGATIVE_WEIGHTS
@@ -577,7 +577,7 @@ if __name__ == "__main__":
         help="Negatives per user in eval pool (default: 99)",
     )
     parser.add_argument(
-        "--seed", type=int, default=20, help="Random seed (default: 42)"
+        "--seed", type=int, default=42, help="Random seed (default: 42)"
     )
     parser.add_argument(
         "--pos-pct",

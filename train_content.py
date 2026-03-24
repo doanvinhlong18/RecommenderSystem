@@ -81,19 +81,19 @@ def train_content_model(anime_df, use_sbert: bool = True) -> ContentBasedRecomme
     builder.fit(anime_df)
 
     if use_sbert:
-        w_struct, w_text, w_member = 0.2, 0.5, 0.3
+        w_struct, w_text, w_tmp = 0.3, 0.55, 0.15
         logger.info(
             f"  Fusing SBERT ({w_text*100:.0f}%) "
             f"+ Structured ({w_struct*100:.0f}%) "
-            f"+ Member ({w_member*100:.0f}%)..."
+            f"+ Member ({w_tmp*100:.0f}%)..."
         )
         final_emb = builder.transform(
-            anime_df, sbert_emb, w_struct=w_struct, w_text=w_text, w_member=w_member
+            anime_df, sbert_emb, w_struct=w_struct, w_text=w_text, w_tmp=w_tmp
         )
     else:
         logger.info("  Using structured features only...")
         final_emb = builder.transform(
-            anime_df, sbert_emb, w_struct=0.5, w_text=0.0, w_member=0.5
+            anime_df, sbert_emb, w_struct=0.5, w_text=0.0, w_tmp=0.5
         )
 
     logger.info(f"  Final embedding shape: {final_emb.shape}")

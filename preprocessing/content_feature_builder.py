@@ -83,9 +83,9 @@ class ContentFeatureBuilder:
         self,
         df: pd.DataFrame,
         sbert_embeddings: np.ndarray,
-        w_struct: float = 0.25,
+        w_struct: float = 0.35,
         w_text: float = 0.5,
-        w_member: float = 0.25,
+        w_tmp: float = 0.15,
     ) -> np.ndarray:
         """
         Build final embedding matrix.
@@ -97,24 +97,24 @@ class ContentFeatureBuilder:
             FIX: normalize từng phần riêng về unit norm TRƯỚC khi nhân weight,
             sau đó hstack mà KHÔNG normalize lại.
             → norm(part_struct) = w_struct
-            → norm(part_member) = w_member
+            → norm(part_tmp) = w_tmp
             → norm(part_sbert)  = w_text
             → mỗi phần đóng góp đúng theo weight vào cosine similarity,
               bất kể chênh lệch số chiều.
 
-        Default: w_struct=0.25, w_text=0.5, w_member=0.25
+        Default: w_struct=0.35, w_text=0.5, w_tmp=0.15
             SBERT capture semantic tốt hơn (isekai, dark fantasy, romance...)
             Struct giúp lọc hard constraints: type, genre.
-            Member giúp cân bằng theo độ phổ biến và thời đại.
+           _tmp giúp cân bằng theo độ phổ biến và thời đại.
         """
         if not self._is_fitted:
             raise ValueError("ContentFeatureBuilder not fitted. Call fit() first.")
 
         # FIX: dùng atol rõ ràng để tránh false positive từ float arithmetic
-        if not np.isclose(w_struct + w_text + w_member, 1.0, atol=1e-5):
+        if not np.isclose(w_struct + w_text + w_tmp, 1.0, atol=1e-5):
             raise ValueError(
-                f"w_struct + w_text + w_member must equal 1.0 "
-                f"(got {w_struct + w_text + w_member:.6f})"
+                f"w_struct + w_text + w_tmp must equal 1.0 "
+                f"(got {w_struct + w_text + w_tmp:.6f})"
             )
 
         if len(df) != len(sbert_embeddings):
@@ -166,24 +166,14 @@ class ContentFeatureBuilder:
         )
         ep_norm = np.clip(ep_norm, 0, 1)
 
-        # ---------- MEMBERS ----------
-        if self.max_members is not None and "Members" in df.columns:
-            members = pd.to_numeric(df["Members"], errors="coerce").fillna(0).values
-            members_norm = (
-                (np.log1p(members) / self.max_members).reshape(-1, 1).astype(np.float32)
-            )
-            members_norm = np.clip(members_norm, 0, 1)
-        else:
-            members_norm = np.zeros((len(df), 1), dtype=np.float32)
-
         # ---------- CONCAT + NORMALIZE STRUCTURED → unit norm ----------
         structured = np.hstack([type_vec, genre_matrix]).astype(np.float32)
         structured = normalize(structured)
 
         # FIX: thêm epsilon trước normalize để tránh zero vector khi toàn bộ
         # year/ep/members đều bằng 0 cho một hàng (mất đóng góp cosine)
-        member = np.hstack([year_norm, ep_norm, members_norm]).astype(np.float32)
-        member = normalize(member + 1e-8)
+        tmp = np.hstack([year_norm, ep_norm]).astype(np.float32)
+        tmp = normalize(tmp + 1e-8)
 
         # ---------- NORMALIZE SBERT → unit norm ----------
         sbert_norm = normalize(sbert_embeddings.astype(np.float32))
@@ -194,7 +184,7 @@ class ContentFeatureBuilder:
         final_vector = np.hstack(
             [
                 structured * w_struct,  # norm = w_struct
-                member * w_member,  # norm = w_member
+                tmp * w_tmp,  # norm = w_tmp
                 sbert_norm * w_text,  # norm = w_text
             ]
         )
