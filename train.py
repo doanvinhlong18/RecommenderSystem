@@ -117,7 +117,7 @@ def train_content_model(
 
     # Step 3: Fit recommender
     logger.info("Step 3: Fitting ContentBasedRecommender...")
-    model = ContentBasedRecommender(device=device)
+    model = ContentBasedRecommender()
     model.fit(anime_df, final_emb)
 
     elapsed = time.time() - start_time
