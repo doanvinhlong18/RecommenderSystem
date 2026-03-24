@@ -331,13 +331,19 @@ class HybridEngine:
         if self.collaborative_model:
             try:
                 collab_recs = self.collaborative_model.recommend_for_user(
-                    user_id, top_k=top_k * 3, exclude_rated=exclude_watched
+                    user_id,
+                    top_k=top_k * 3,
+                    exclude_rated=exclude_watched,
+                    rated_items=exclude_set,
                 )
                 weight = self.weights.get('collaborative', 0.4)
                 for rec in collab_recs:
                     aid = rec['mal_id']
-                    # Normalize predicted rating to 0-1
-                    norm_score = rec.get('predicted_rating', rec.get('similarity', 5)) / 10
+                    if 'score' in rec:
+                        raw_score = np.clip(rec['score'], -20, 20)
+                        norm_score = 1.0 / (1.0 + np.exp(-raw_score))
+                    else:
+                        norm_score = rec.get('predicted_rating', rec.get('similarity', 5)) / 10
                     scores[aid] = scores.get(aid, 0) + weight * norm_score
             except Exception as e:
                 logger.warning(f"Collaborative recommendation error: {e}")
@@ -346,7 +352,10 @@ class HybridEngine:
         if self.implicit_model:
             try:
                 implicit_recs = self.implicit_model.recommend_for_user(
-                    user_id, top_k=top_k * 3, exclude_known=exclude_watched
+                    user_id,
+                    top_k=top_k * 3,
+                    exclude_known=exclude_watched,
+                    known_items=exclude_set,
                 )
                 weight = self.weights.get('implicit', 0.2)
                 for rec in implicit_recs:
