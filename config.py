@@ -38,8 +38,8 @@ class DataConfig:
 
     # Sampling settings for large datasets
     sample_ratings: bool = False
-    rating_sample_size: int = 10_000_000  # 5M samples for development
-    animelist_sample_size: int = 10_000_000  # 10M samples
+    rating_sample_size: int = None  # 5M samples for development
+    animelist_sample_size: int = None  # 10M samples
 
     # Minimum thresholds
     min_user_ratings: int = 15

@@ -1,0 +1,28 @@
+# GPU-specific requirements for the Anime Recommendation System
+# Install these on top of requirements.txt for GPU acceleration
+#
+# Usage:
+#   pip install -r requirements.txt
+#   pip install -r requirements-gpu.txt
+#
+# Note: Requires NVIDIA CUDA toolkit installed on your system
+
+# PyTorch with CUDA support (adjust cu118 for your CUDA version)
+# Check your CUDA version with: nvcc --version
+# CUDA 11.8:
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch>=2.0.0
+
+# CUDA 12.1:
+# --extra-index-url https://download.pytorch.org/whl/cu121
+# torch>=2.0.0
+
+# FAISS GPU (requires matching CUDA version)
+# Install with: conda install -c pytorch faiss-gpu
+# Or: pip install faiss-gpu
+
+# Implicit with GPU support
+# Install with: pip install implicit[gpu]
+# Or: conda install -c conda-forge implicit
+
+# Note: sentence-transformers automatically uses GPU if torch+CUDA is available

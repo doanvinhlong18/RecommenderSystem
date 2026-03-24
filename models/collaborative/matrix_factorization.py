@@ -6,6 +6,7 @@ powered by the `implicit` library for top-K ranking.
 """
 import logging
 import pickle
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -16,9 +17,48 @@ import sys
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from config import model_config
+from device_config import get_device, is_gpu_available, log_gpu_memory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# PyTorch-based Matrix Factorization Model
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    logger.warning("PyTorch not available. GPU acceleration disabled for MatrixFactorization.")
+
+
+class TorchMatrixFactorization(nn.Module):
+    """PyTorch-based Matrix Factorization for GPU training."""
+
+    def __init__(self, n_users: int, n_items: int, n_factors: int):
+        super().__init__()
+        self.user_embedding = nn.Embedding(n_users, n_factors)
+        self.item_embedding = nn.Embedding(n_items, n_factors)
+        self.user_bias = nn.Embedding(n_users, 1)
+        self.item_bias = nn.Embedding(n_items, 1)
+        self.global_bias = nn.Parameter(torch.zeros(1))
+
+        # Initialize weights
+        nn.init.normal_(self.user_embedding.weight, std=0.1)
+        nn.init.normal_(self.item_embedding.weight, std=0.1)
+        nn.init.zeros_(self.user_bias.weight)
+        nn.init.zeros_(self.item_bias.weight)
+
+    def forward(self, user_ids, item_ids):
+        user_emb = self.user_embedding(user_ids)
+        item_emb = self.item_embedding(item_ids)
+
+        dot_product = (user_emb * item_emb).sum(dim=1)
+        user_b = self.user_bias(user_ids).squeeze()
+        item_b = self.item_bias(item_ids).squeeze()
+
+        return self.global_bias + user_b + item_b + dot_product
 
 
 class MatrixFactorization:
@@ -81,6 +121,18 @@ class MatrixFactorization:
             else warm_start_from_als
         )
 
+        # Device configuration
+        self.device = device or get_device()
+
+        # Auto-detect whether to use PyTorch
+        if use_torch is None:
+            self.use_torch = TORCH_AVAILABLE and (method == "torch" or is_gpu_available())
+        else:
+            self.use_torch = use_torch and TORCH_AVAILABLE
+
+        # PyTorch model
+        self._torch_model: Optional[TorchMatrixFactorization] = None
+
         self.user_factors: Optional[np.ndarray] = None
         self.item_factors: Optional[np.ndarray] = None
         self.user_bias: Optional[np.ndarray] = None
@@ -94,6 +146,8 @@ class MatrixFactorization:
         self.idx_to_anime: Dict[int, int] = {}
         self.user_to_idx: Dict[int, int] = {}
         self.idx_to_user: Dict[int, int] = {}
+
+        logger.info(f"MatrixFactorization initialized with device: {self.device}, use_torch: {self.use_torch}")
 
     def fit(
         self,
@@ -132,10 +186,19 @@ class MatrixFactorization:
         n_users, n_items = user_item_matrix.shape
         logger.info(f"Fitting {self.method.upper()} with {self.n_factors} factors...")
         logger.info(f"Matrix shape: {n_users} users x {n_items} items")
+        logger.info(f"Training on device: {self.device.upper()}")
 
         self.global_mean = float(user_item_matrix.data.mean()) if user_item_matrix.nnz else 0.0
 
-        if self.method == "als":
+        start_time = time.time()
+
+        # Log GPU memory before training
+        log_gpu_memory("Before MF training: ")
+
+        if self.use_torch and TORCH_AVAILABLE:
+            logger.info("Using PyTorch-based Matrix Factorization")
+            self._fit_torch(user_item_matrix, n_users, n_items, verbose)
+        elif self.method == "als":
             self._fit_als(user_item_matrix, n_users, n_items, verbose)
         elif self.method == "svd":
             self._fit_svd(user_item_matrix, n_users, n_items, verbose)
@@ -150,8 +213,88 @@ class MatrixFactorization:
         else:
             raise ValueError(f"Unsupported matrix factorization method: {self.method}")
 
+        elapsed = time.time() - start_time
+        logger.info(f"Matrix Factorization training completed in {elapsed:.2f}s")
+
+        # Log GPU memory after training
+        log_gpu_memory("After MF training: ")
+
         logger.info("Matrix Factorization fitted successfully")
         return self
+
+    def _fit_torch(
+        self,
+        matrix: csr_matrix,
+        n_users: int,
+        n_items: int,
+        verbose: bool
+    ) -> None:
+        """Fit using PyTorch with GPU support."""
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+
+        device = torch.device(self.device)
+        logger.info(f"PyTorch training on: {device}")
+
+        # Create PyTorch model
+        self._torch_model = TorchMatrixFactorization(n_users, n_items, self.n_factors)
+        self._torch_model.to(device)
+        self._torch_model.global_bias.data.fill_(self.global_mean)
+
+        # Prepare training data
+        rows, cols = matrix.nonzero()
+        ratings = matrix.data.astype(np.float32)
+
+        user_ids = torch.LongTensor(rows)
+        item_ids = torch.LongTensor(cols)
+        rating_values = torch.FloatTensor(ratings)
+
+        dataset = TensorDataset(user_ids, item_ids, rating_values)
+        batch_size = 4096 if self.device == "cuda" else 1024
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+        # Optimizer and loss
+        optimizer = torch.optim.Adam(
+            self._torch_model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.regularization
+        )
+        criterion = nn.MSELoss()
+
+        # Training loop
+        for epoch in range(self.n_epochs):
+            total_loss = 0
+            n_batches = 0
+
+            for batch_users, batch_items, batch_ratings in dataloader:
+                batch_users = batch_users.to(device)
+                batch_items = batch_items.to(device)
+                batch_ratings = batch_ratings.to(device)
+
+                optimizer.zero_grad()
+                predictions = self._torch_model(batch_users, batch_items)
+                loss = criterion(predictions, batch_ratings)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                n_batches += 1
+
+            avg_loss = total_loss / n_batches
+            rmse = np.sqrt(avg_loss)
+
+            if verbose and (epoch + 1) % 5 == 0:
+                logger.info(f"Epoch {epoch + 1}/{self.n_epochs}, RMSE: {rmse:.4f}")
+
+        # Extract factors to numpy arrays
+        self._torch_model.eval()
+        with torch.no_grad():
+            self.user_factors = self._torch_model.user_embedding.weight.cpu().numpy()
+            self.item_factors = self._torch_model.item_embedding.weight.cpu().numpy()
+            self.user_bias = self._torch_model.user_bias.weight.cpu().numpy().flatten()
+            self.item_bias = self._torch_model.item_bias.weight.cpu().numpy().flatten()
+            self.global_mean = self._torch_model.global_bias.item()
 
     def _fit_svd(
         self,
