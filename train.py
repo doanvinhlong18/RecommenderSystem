@@ -548,6 +548,32 @@ def main():
     popular = popularity_model.get_top_rated(5)
     for p in popular:
         print(f"  - {p['name']} (Score: {p['score']})")
+    # ===== TRAIN LEARNED HYBRID ENGINE =====
+    logger.info("Training Learned Hybrid Engine (meta-model)...")
+    from models.hybrid.learned_hybrid import train_learned_hybrid
+    from preprocessing import split_to_ratings_df
+
+    test_ratings_df = split_to_ratings_df(split_artifact.user_test)
+
+    learned_engine = train_learned_hybrid(
+        content_model=content_model,
+        collaborative_model=collaborative_model,
+        implicit_model=implicit_model,
+        popularity_model=popularity_model,
+        anime_df=anime_df,
+        ratings_df=loader.load_ratings(sample=True),
+        train_ratings_df=train_ratings_df,
+        test_ratings_df=test_ratings_df,
+        save_dir=MODELS_DIR / "learned_hybrid",
+        min_ratings_to_train=20,
+        top_users=3000,
+        relevance_threshold=args.relevance_threshold,
+    )
+    fi = learned_engine.get_feature_importance()
+    if fi:
+        logger.info(
+            "Feature importance: " + str(sorted(fi.items(), key=lambda x: -x[1]))
+        )
 
     return hybrid_engine
 

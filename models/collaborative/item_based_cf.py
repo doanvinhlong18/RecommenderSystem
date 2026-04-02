@@ -1,6 +1,22 @@
 """
 Item-Based Collaborative Filtering.
+
+Fix so với bản gốc:
+  BUG OOM: _build_faiss_index() gọi item_user_matrix.toarray()
+  → 17K items × 320K users × 4 bytes = 21.8 GB RAM → crash
+
+  FIX: ItemBasedCF KHÔNG dùng FAISS trên user-space vectors.
+  Lý do:
+    - item_user_matrix.T có dimension = 320K → FAISS với dim=320K vô nghĩa
+    - ALS implicit đã có FAISS built-in qua thư viện implicit
+    - Với 17K items, sklearn cosine_similarity on-demand đủ nhanh (~50ms)
+    - Nếu muốn FAISS cho CF item similarity: cần reduced vectors (PCA hoặc ALS factors)
+      → xem phần _build_faiss_index_from_factors() bên dưới
+
+  Thêm: _build_faiss_index_from_factors() — optional, dùng khi có ALS item factors
+  Nếu truyền item_factors (50-dim từ ALS) thì build FAISS trên đó thay vì user-space
 """
+
 import numpy as np
 import pandas as pd
 import logging
@@ -11,6 +27,7 @@ from scipy.sparse import csr_matrix
 from sklearn.metrics.pairwise import cosine_similarity
 
 import sys
+
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from config import MODELS_DIR
 
@@ -20,37 +37,29 @@ logger = logging.getLogger(__name__)
 
 class ItemBasedCF:
     """
-    Item-Based Collaborative Filtering recommender.
+    Item-Based Collaborative Filtering.
 
-    Computes item-item similarity based on user rating patterns.
-
-    Attributes:
-        item_similarity: Item-item similarity matrix
-        user_item_matrix: Original user-item rating matrix
-        anime_to_idx: Anime ID to matrix index mapping
-        idx_to_anime: Matrix index to anime ID mapping
+    FAISS usage:
+      - Không dùng FAISS trên user-space vectors (dim=320K → OOM)
+      - Optional: _build_faiss_index_from_factors(item_factors) với 50-dim ALS factors
+        Chỉ hữu ích nếu cần item similarity nhanh và không muốn dùng implicit library
     """
 
     def __init__(self, k_neighbors: int = 50):
-        """
-        Initialize ItemBasedCF.
-
-        Args:
-            k_neighbors: Number of neighbors to consider
-        """
         self.k_neighbors = k_neighbors
         self.item_similarity: Optional[np.ndarray] = None
         self.user_item_matrix: Optional[csr_matrix] = None
         self.mean_ratings: Optional[np.ndarray] = None
 
-        # Mappings
         self.anime_to_idx: Dict[int, int] = {}
         self.idx_to_anime: Dict[int, int] = {}
         self.user_to_idx: Dict[int, int] = {}
         self.idx_to_user: Dict[int, int] = {}
 
-        # For FAISS
-        self.faiss_index = None
+        # FAISS index — chỉ được build nếu gọi _build_faiss_index_from_factors()
+        # KHÔNG build từ user-space vectors (OOM với 320K users)
+        self._faiss_index = None
+        self._faiss_item_factors: Optional[np.ndarray] = None
 
     def fit(
         self,
@@ -59,21 +68,26 @@ class ItemBasedCF:
         idx_to_anime: Dict[int, int],
         user_to_idx: Dict[int, int] = None,
         idx_to_user: Dict[int, int] = None,
-        compute_full_similarity: bool = False
+        compute_full_similarity: bool = False,
+        item_factors: Optional[np.ndarray] = None,  # ALS factors nếu có
     ) -> "ItemBasedCF":
         """
-        Fit the Item-Based CF model.
+        Fit Item-Based CF.
 
-        Args:
-            user_item_matrix: Sparse user-item rating matrix
-            anime_to_idx: Anime ID to index mapping
-            idx_to_anime: Index to anime ID mapping
-            user_to_idx: User ID to index mapping
-            idx_to_user: Index to user ID mapping
-            compute_full_similarity: Whether to compute full similarity matrix
+        Parameters
+        ----------
+        user_item_matrix : csr_matrix (n_users, n_items)
+        compute_full_similarity : tính full item×item matrix (memory intensive, ~2.3GB với 17K items)
+        item_factors : optional np.ndarray (n_items, n_factors) từ ALS
+                       Nếu có, build FAISS index trên 50-dim factors thay vì user-space
 
-        Returns:
-            Self for chaining
+        NOTE về FAISS:
+          KHÔNG gọi .toarray() trên item_user_matrix để build FAISS
+          item_user_matrix.T.toarray() = (17K, 320K) = 21.8 GB → OOM crash
+          Thay vào đó:
+            - Nếu compute_full_similarity=True: dùng sklearn cosine_similarity (chunk-wise)
+            - Nếu False: dùng on-demand cosine similarity khi query
+            - Nếu item_factors (ALS 50-dim): build FAISS IndexFlatIP trên đó (~3MB)
         """
         self.user_item_matrix = user_item_matrix
         self.anime_to_idx = anime_to_idx
@@ -81,289 +95,221 @@ class ItemBasedCF:
         self.user_to_idx = user_to_idx or {}
         self.idx_to_user = idx_to_user or {}
 
-        logger.info(f"Fitting Item-Based CF on matrix {user_item_matrix.shape}...")
+        n_users, n_items = user_item_matrix.shape
+        logger.info(f"Fitting Item-Based CF: {n_users} users × {n_items} items")
 
         # Compute mean ratings per item
         item_sums = np.array(user_item_matrix.sum(axis=0)).flatten()
         item_counts = np.array((user_item_matrix > 0).sum(axis=0)).flatten()
-        item_counts[item_counts == 0] = 1  # Avoid division by zero
+        item_counts[item_counts == 0] = 1
         self.mean_ratings = item_sums / item_counts
 
-        # Item-user matrix (transpose)
         item_user_matrix = user_item_matrix.T.tocsr()
 
         if compute_full_similarity:
-            # Compute full item-item similarity (memory intensive)
-            logger.info("Computing full item-item similarity matrix...")
-            self.item_similarity = cosine_similarity(item_user_matrix)
+            # Full similarity matrix — dùng sklearn (chunk-wise, không load toàn bộ dense)
+            # Chỉ nên dùng khi n_items nhỏ (<5K)
+            logger.warning(
+                "compute_full_similarity=True với %d items có thể tốn RAM (~%.1f GB). "
+                "Dùng False và on-demand similarity để an toàn hơn.",
+                n_items,
+                n_items * n_items * 4 / 1e9,
+            )
+            logger.info(
+                "Computing full item-item similarity matrix (sklearn, sparse-aware)..."
+            )
+            self.item_similarity = cosine_similarity(
+                item_user_matrix, dense_output=True
+            )
             logger.info(f"Item similarity matrix shape: {self.item_similarity.shape}")
         else:
-            # Build FAISS index for on-demand similarity
-            self._build_faiss_index(item_user_matrix)
+            logger.info("Dùng on-demand cosine similarity (không tính full matrix)")
+            self.item_similarity = None
+
+            # Nếu có ALS item factors → build FAISS index nhỏ (50-dim)
+            if item_factors is not None:
+                self._build_faiss_index_from_factors(item_factors)
 
         logger.info("Item-Based CF fitted successfully")
         return self
 
-    def _build_faiss_index(self, item_user_matrix: csr_matrix) -> None:
-        """Build FAISS index for efficient similarity search."""
+    def _build_faiss_index_from_factors(self, item_factors: np.ndarray) -> None:
+        """
+        Build FAISS IndexFlatIP từ ALS item factors (50-dim).
+
+        Đây là cách đúng để dùng FAISS cho ItemBasedCF:
+          - item_factors: (17K, 50-dim) thay vì (17K, 320K-dim)
+          - IndexFlatIP: 17K × 50 × 4 bytes = 3.4 MB (trivial)
+          - Exact search, nhanh hơn cosine_similarity on-demand
+
+        Parameters
+        ----------
+        item_factors : np.ndarray (n_items, n_factors) — từ ALS model sau khi train
+        """
         try:
             import faiss
-
-            logger.info("Building FAISS index for item similarity...")
-
-            # Convert to dense and normalize
-            item_vectors = item_user_matrix.toarray().astype(np.float32)
-            norms = np.linalg.norm(item_vectors, axis=1, keepdims=True)
-            norms[norms == 0] = 1
-            item_vectors = item_vectors / norms
-
-            # Build index
-            d = item_vectors.shape[1]
-            self.faiss_index = faiss.IndexFlatIP(d)
-            self.faiss_index.add(item_vectors)
-
-            logger.info(f"FAISS index built with {self.faiss_index.ntotal} items")
-
         except ImportError:
-            logger.warning("FAISS not installed. Will use sklearn for similarity.")
-            # Fallback: compute similarity on-demand
-            self.item_vectors_normalized = None
+            logger.info("faiss chưa cài — bỏ qua FAISS cho ItemBasedCF")
+            return
+
+        from sklearn.preprocessing import normalize as sk_normalize
+
+        vecs = sk_normalize(item_factors.astype(np.float32))
+        n, d = vecs.shape
+
+        # 17K items, 50-dim → IndexFlatIP là exact và đủ nhanh (~0.1ms)
+        index = faiss.IndexFlatIP(d)
+        index.add(vecs)
+
+        self._faiss_index = index
+        self._faiss_item_factors = vecs
+        logger.info(f"FAISS IndexFlatIP built từ item factors: {n} items, dim={d}")
 
     def get_similar_items(
         self,
         anime_id: int,
-        top_k: int = 10
+        top_k: int = 10,
     ) -> List[Dict]:
         """
-        Get similar anime based on collaborative filtering.
+        Lấy top_k anime tương tự theo CF (user co-occurrence).
 
-        Args:
-            anime_id: Anime ID
-            top_k: Number of similar items
+        Ưu tiên:
+          1. Full similarity matrix (nếu đã tính trong fit)
+          2. FAISS trên ALS item factors (nếu có)
+          3. On-demand cosine similarity (fallback an toàn)
 
-        Returns:
-            List of similar anime dictionaries
+        Parameters
+        ----------
+        anime_id : anime ID
+        top_k    : số kết quả
+
+        Returns
+        -------
+        List[Dict]: mal_id, similarity
         """
         if anime_id not in self.anime_to_idx:
-            logger.warning(f"Anime ID {anime_id} not in training data")
+            logger.warning(f"Anime {anime_id} không có trong training data")
             return []
 
         idx = self.anime_to_idx[anime_id]
 
         if self.item_similarity is not None:
-            # Use precomputed similarity
+            # Option 1: Precomputed full similarity
             similarities = self.item_similarity[idx]
-            similar_indices = similarities.argsort()[::-1][1:top_k+1]
+            similar_indices = similarities.argsort()[::-1][1 : top_k + 1]
             similar_scores = similarities[similar_indices]
-        elif self.faiss_index is not None:
-            # Use FAISS
-            item_user_matrix = self.user_item_matrix.T.tocsr()
-            query = item_user_matrix[idx].toarray().astype(np.float32)
-            norm = np.linalg.norm(query)
-            if norm > 0:
-                query = query / norm
 
-            scores, indices = self.faiss_index.search(query, top_k + 1)
-            # Filter out self
+        elif self._faiss_index is not None:
+            # Option 2: FAISS trên ALS item factors (50-dim)
+            query = self._faiss_item_factors[idx].reshape(1, -1)
+            scores, indices = self._faiss_index.search(query, top_k + 1)
             mask = indices[0] != idx
             similar_indices = indices[0][mask][:top_k]
             similar_scores = scores[0][mask][:top_k]
+
         else:
-            # Compute on-demand
+            # Option 3: On-demand cosine similarity (an toàn, không OOM)
             item_user_matrix = self.user_item_matrix.T.tocsr()
             query = item_user_matrix[idx]
+            # cosine_similarity với sparse matrix — không toarray() toàn bộ
             similarities = cosine_similarity(query, item_user_matrix).flatten()
-            similar_indices = similarities.argsort()[::-1][1:top_k+1]
+            similar_indices = similarities.argsort()[::-1][1 : top_k + 1]
             similar_scores = similarities[similar_indices]
 
         results = []
         for sim_idx, score in zip(similar_indices, similar_scores):
-            results.append({
-                'mal_id': self.idx_to_anime[sim_idx],
-                'similarity': float(score),
-                'mean_rating': float(self.mean_ratings[sim_idx])
-            })
+            sim_idx = int(sim_idx)
+            if sim_idx not in self.idx_to_anime:
+                continue
+            results.append(
+                {
+                    "mal_id": self.idx_to_anime[sim_idx],
+                    "similarity": float(score),
+                }
+            )
 
         return results
-
-    def predict_rating(
-        self,
-        user_id: int,
-        anime_id: int
-    ) -> float:
-        """
-        Predict rating for a user-item pair.
-
-        Args:
-            user_id: User ID
-            anime_id: Anime ID
-
-        Returns:
-            Predicted rating
-        """
-        if user_id not in self.user_to_idx or anime_id not in self.anime_to_idx:
-            return self.mean_ratings.mean() if self.mean_ratings is not None else 5.0
-
-        user_idx = self.user_to_idx[user_id]
-        item_idx = self.anime_to_idx[anime_id]
-
-        # Get user's rated items
-        user_ratings = self.user_item_matrix[user_idx].toarray().flatten()
-        rated_items = np.where(user_ratings > 0)[0]
-
-        if len(rated_items) == 0:
-            return self.mean_ratings[item_idx]
-
-        # Get similarities with rated items
-        if self.item_similarity is not None:
-            similarities = self.item_similarity[item_idx, rated_items]
-        else:
-            # Compute on-demand
-            item_user_matrix = self.user_item_matrix.T.tocsr()
-            query = item_user_matrix[item_idx]
-            all_sims = cosine_similarity(query, item_user_matrix[rated_items]).flatten()
-            similarities = all_sims
-
-        # Get top-k neighbors
-        if len(similarities) > self.k_neighbors:
-            top_k_indices = similarities.argsort()[::-1][:self.k_neighbors]
-            similarities = similarities[top_k_indices]
-            rated_items = rated_items[top_k_indices]
-
-        # Weighted average
-        if similarities.sum() > 0:
-            prediction = np.dot(similarities, user_ratings[rated_items]) / similarities.sum()
-        else:
-            prediction = self.mean_ratings[item_idx]
-
-        return float(np.clip(prediction, 1, 10))
 
     def recommend_for_user(
         self,
         user_id: int,
         top_k: int = 10,
-        exclude_rated: bool = True
+        exclude_rated: bool = True,
+        rated_items: set = None,
     ) -> List[Dict]:
         """
-        Generate recommendations for a user.
+        Gợi ý cho user dựa trên item-based CF.
 
-        Args:
-            user_id: User ID
-            top_k: Number of recommendations
-            exclude_rated: Whether to exclude already rated items
-
-        Returns:
-            List of recommendation dictionaries
+        Predict score = mean-centered weighted sum của similar items.
         """
         if user_id not in self.user_to_idx:
-            logger.warning(f"User ID {user_id} not in training data")
+            logger.warning(f"User {user_id} không có trong training data")
             return []
 
         user_idx = self.user_to_idx[user_id]
-        user_ratings = self.user_item_matrix[user_idx].toarray().flatten()
-        rated_items = set(np.where(user_ratings > 0)[0])
+        user_ratings = self.user_item_matrix[user_idx]
+        rated_indices = user_ratings.indices
+        rated_values = user_ratings.data
 
-        # Predict ratings for all unrated items
-        predictions = []
+        if len(rated_indices) == 0:
+            return []
 
-        for item_idx in range(self.user_item_matrix.shape[1]):
-            if exclude_rated and item_idx in rated_items:
-                continue
+        # Predict scores for all unrated items
+        scores = {}
 
-            anime_id = self.idx_to_anime[item_idx]
-            pred_rating = self.predict_rating(user_id, anime_id)
-            predictions.append((item_idx, pred_rating))
+        for item_idx, rating in zip(rated_indices, rated_values):
+            sim_recs = self.get_similar_items(
+                self.idx_to_anime[item_idx], top_k=self.k_neighbors
+            )
+            for rec in sim_recs:
+                mal_id = rec["mal_id"]
+                target_idx = self.anime_to_idx[mal_id]
+                if target_idx in rated_indices:
+                    continue
+                sim = rec["similarity"]
+                center_rating = rating - self.mean_ratings[item_idx]
+                if mal_id not in scores:
+                    scores[mal_id] = {"num": 0.0, "denom": 0.0, "idx": target_idx}
+                scores[mal_id]["num"] += sim * center_rating
+                scores[mal_id]["denom"] += abs(sim)
 
-        # Sort by predicted rating
-        predictions.sort(key=lambda x: x[1], reverse=True)
-
+        # Build results
         results = []
-        for item_idx, pred_rating in predictions[:top_k]:
-            results.append({
-                'mal_id': self.idx_to_anime[item_idx],
-                'predicted_rating': pred_rating,
-                'mean_rating': float(self.mean_ratings[item_idx])
-            })
+        exclude_set = rated_items or set()
+        for mal_id, s in scores.items():
+            if exclude_rated and mal_id in exclude_set:
+                continue
+            if s["denom"] == 0:
+                continue
+            pred = self.mean_ratings[s["idx"]] + s["num"] / s["denom"]
+            results.append(
+                {
+                    "mal_id": mal_id,
+                    "predicted_rating": float(np.clip(pred, 1, 10)),
+                    "similarity": float(s["num"] / s["denom"]),
+                }
+            )
 
-        return results
+        results.sort(key=lambda x: -x["predicted_rating"])
+        return results[:top_k]
 
     def save(self, filepath: Union[str, Path]) -> None:
-        """Save model to file."""
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
-
-        state = {
-            'k_neighbors': self.k_neighbors,
-            'item_similarity': self.item_similarity,
-            'user_item_matrix': self.user_item_matrix,
-            'mean_ratings': self.mean_ratings,
-            'anime_to_idx': self.anime_to_idx,
-            'idx_to_anime': self.idx_to_anime,
-            'user_to_idx': self.user_to_idx,
-            'idx_to_user': self.idx_to_user
-        }
-
-        with open(filepath, 'wb') as f:
+        # Không lưu _faiss_index (không serializable)
+        state = {k: v for k, v in self.__dict__.items() if k not in ("_faiss_index",)}
+        with open(filepath, "wb") as f:
             pickle.dump(state, f)
-
         logger.info(f"ItemBasedCF saved to {filepath}")
 
     def load(self, filepath: Union[str, Path]) -> "ItemBasedCF":
-        """Load model from file."""
         filepath = Path(filepath)
-
-        with open(filepath, 'rb') as f:
+        with open(filepath, "rb") as f:
             state = pickle.load(f)
-
-        self.k_neighbors = state['k_neighbors']
-        self.item_similarity = state['item_similarity']
-        self.user_item_matrix = state['user_item_matrix']
-        self.mean_ratings = state['mean_ratings']
-        self.anime_to_idx = state['anime_to_idx']
-        self.idx_to_anime = state['idx_to_anime']
-        self.user_to_idx = state['user_to_idx']
-        self.idx_to_user = state['idx_to_user']
-
-        # Rebuild FAISS index if needed
-        if self.item_similarity is None:
-            item_user_matrix = self.user_item_matrix.T.tocsr()
-            self._build_faiss_index(item_user_matrix)
-
+        self.__dict__.update(state)
+        self._faiss_index = None
+        # Nếu có _faiss_item_factors đã lưu → rebuild FAISS
+        if self._faiss_item_factors is not None:
+            self._build_faiss_index_from_factors(self._faiss_item_factors)
         logger.info(f"ItemBasedCF loaded from {filepath}")
         return self
-
-
-if __name__ == "__main__":
-    # Test Item-Based CF
-    import sys
-    sys.path.append(str(Path(__file__).parent.parent.parent))
-    from preprocessing import DataLoader, MatrixBuilder
-
-    loader = DataLoader()
-    loader.load_ratings(sample=True)
-
-    builder = MatrixBuilder()
-    builder.build_rating_matrix(loader.ratings_df)
-
-    cf = ItemBasedCF(k_neighbors=20)
-    cf.fit(
-        builder.user_item_matrix,
-        builder.anime_to_idx,
-        builder.idx_to_anime,
-        builder.user_to_idx,
-        builder.idx_to_user
-    )
-
-    # Test similar items
-    test_anime_id = list(builder.anime_to_idx.keys())[0]
-    print(f"\nSimilar items to anime {test_anime_id}:")
-    similar = cf.get_similar_items(test_anime_id, top_k=5)
-    for item in similar:
-        print(f"  Anime {item['mal_id']}: similarity={item['similarity']:.4f}")
-
-    # Test user recommendation
-    test_user_id = list(builder.user_to_idx.keys())[0]
-    print(f"\nRecommendations for user {test_user_id}:")
-    recs = cf.recommend_for_user(test_user_id, top_k=5)
-    for rec in recs:
-        print(f"  Anime {rec['mal_id']}: predicted={rec['predicted_rating']:.2f}")

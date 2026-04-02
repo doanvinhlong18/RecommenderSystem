@@ -1,31 +1,44 @@
 """
-Evaluation script for individual recommendation models.
+evaluate_models.py — Đánh giá toàn bộ mô hình recommendation.
 
-Evaluates each model separately:
-- Content-Based Recommender (TF-IDF + SBERT)
-- Collaborative Filtering (Matrix Factorization)
-- Implicit Feedback (ALS)
-- Popularity-Based
-- Hybrid Engine (Combined)
+Các model được đánh giá:
+  - Content-Based (SBERT + Structured Features)
+  - Collaborative Filtering (MatrixFactorization / BPR)
+  - Implicit Feedback (ALS)
+  - Popularity (baseline)
+  - Hybrid (hard-coded weights, load từ saved_models/hybrid/)
+  - LearnedHybrid (meta-model LightGBM, load từ saved_models/learned_hybrid/)
+
+Tất cả model dùng chung 1 split artifact được tạo trong train.py
+→ so sánh công bằng trên cùng tập test.
+
+Metrics đánh giá:
+  - Precision@K, Recall@K, F1@K
+  - Hit Rate@K (có tìm được item liên quan trong top K không)
+  - MRR (Mean Reciprocal Rank)
+  - NDCG@K (Normalized Discounted Cumulative Gain)
+  - MAP@K (Mean Average Precision)
+  - Diversity: ILD, Genre Coverage, Genre Entropy
 
 Usage:
-    python evaluate_models.py [--sample-users 500] [--k 5 10 20] [--output results.json]
-
-This script no longer creates a fresh split. It loads the persisted split
-artifact created before training and evaluates every model on that same hold-out.
+    python evaluate_models.py
+    python evaluate_models.py --sample-users 500 --k 5 10 20
+    python evaluate_models.py --skip-content --skip-collaborative
+    python evaluate_models.py --only-learned-hybrid  # chỉ eval LearnedHybrid
+    python evaluate_models.py --output my_results.json
 """
+
 import argparse
 import json
 import logging
 import time
-from pathlib import Path
-from typing import Dict, List, Set, Tuple, Optional
 from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
-import pandas as pd
-
 import sys
+
 sys.path.append(str(Path(__file__).parent))
 
 from config import MODELS_DIR, SPLITS_DIR, eval_config
@@ -34,119 +47,46 @@ from models.content import ContentBasedRecommender
 from models.collaborative import MatrixFactorization
 from models.implicit import ALSImplicit
 from models.popularity import PopularityModel
-from models.hybrid import HybridEngine
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Data Loading with Memory Optimization
+# Metric helpers
 # =============================================================================
 
-def load_ratings_for_evaluation(sample_size: int = 1000000) -> pd.DataFrame:
-    """
-    Load ratings data with memory optimization.
-
-    Args:
-        sample_size: Number of ratings to sample
-
-    Returns:
-        DataFrame with user_id, anime_id, rating columns
-    """
-    from config import DATASET_PATH
-
-    rating_file = DATASET_PATH / "rating_complete.csv"
-
-    if not rating_file.exists():
-        raise FileNotFoundError(f"Rating file not found: {rating_file}")
-
-    logger.info(f"Loading ratings (sample: {sample_size:,})...")
-
-    chunks = []
-    total_rows = 0
-
-    # Use smaller dtype to save memory
-    dtype = {
-        'user_id': 'int32',
-        'anime_id': 'int32',
-        'rating': 'int8'
-    }
-
-    try:
-        for chunk in pd.read_csv(
-            rating_file,
-            usecols=['user_id', 'anime_id', 'rating'],
-            dtype=dtype,
-            chunksize=500000
-        ):
-            # Keep ALL ratings (including negative) - FIX #1
-            # Only filter out invalid ratings (-1 means not rated)
-            chunk = chunk[chunk['rating'] >= 0]
-            chunks.append(chunk)
-            total_rows += len(chunk)
-
-            if total_rows >= sample_size:
-                break
-
-        ratings_df = pd.concat(chunks, ignore_index=True)
-
-        if len(ratings_df) > sample_size:
-            ratings_df = ratings_df.sample(n=sample_size, random_state=42)
-
-        logger.info(f"Loaded {len(ratings_df):,} ratings")
-        return ratings_df
-
-    except Exception as e:
-        logger.error(f"Error loading ratings: {e}")
-        raise
-
-
-# =============================================================================
-# Metric Calculation Functions
-# =============================================================================
 
 def precision_at_k(recommended: List[int], relevant: Set[int], k: int) -> float:
-    """Precision@K = |recommended ∩ relevant| / K"""
     if k <= 0 or not recommended:
         return 0.0
-    rec_k = recommended[:k]
-    hits = len(set(rec_k) & relevant)
+    hits = len(set(recommended[:k]) & relevant)
     return hits / k
 
 
 def recall_at_k(recommended: List[int], relevant: Set[int], k: int) -> float:
-    """Recall@K = |recommended ∩ relevant| / |relevant|"""
     if not relevant or not recommended:
         return 0.0
-    rec_k = recommended[:k]
-    hits = len(set(rec_k) & relevant)
+    hits = len(set(recommended[:k]) & relevant)
     return hits / len(relevant)
 
 
-def f1_at_k(precision: float, recall: float) -> float:
-    """F1@K = 2 * Precision * Recall / (Precision + Recall)"""
-    if precision + recall == 0:
+def f1_at_k(prec: float, rec: float) -> float:
+    if prec + rec == 0:
         return 0.0
-    return 2 * (precision * recall) / (precision + recall)
+    return 2 * prec * rec / (prec + rec)
 
 
 def hit_rate_at_k(recommended: List[int], relevant: Set[int], k: int) -> float:
-    """Hit Rate@K = 1 if any relevant item in top K, else 0"""
     if not relevant or not recommended:
         return 0.0
-    rec_k = set(recommended[:k])
-    return 1.0 if rec_k & relevant else 0.0
+    return 1.0 if set(recommended[:k]) & relevant else 0.0
 
 
-def mrr(recommended: List[int], relevant: Set[int]) -> float:
-    """MRR = 1 / rank of first relevant item"""
-    if not relevant or not recommended:
-        return 0.0
+def mrr_score(recommended: List[int], relevant: Set[int]) -> float:
     for i, item in enumerate(recommended):
         if item in relevant:
             return 1.0 / (i + 1)
@@ -154,256 +94,141 @@ def mrr(recommended: List[int], relevant: Set[int]) -> float:
 
 
 def ndcg_at_k(recommended: List[int], relevant: Set[int], k: int) -> float:
-    """NDCG@K = DCG@K / IDCG@K"""
     if not relevant or not recommended:
         return 0.0
-
     rec_k = recommended[:k]
-
-    # DCG
-    dcg = 0.0
-    for i, item in enumerate(rec_k):
-        if item in relevant:
-            dcg += 1.0 / np.log2(i + 2)
-
-    # IDCG
-    ideal_hits = min(len(relevant), k)
-    idcg = sum(1.0 / np.log2(i + 2) for i in range(ideal_hits))
-
+    dcg = sum(1.0 / np.log2(i + 2) for i, item in enumerate(rec_k) if item in relevant)
+    idcg = sum(1.0 / np.log2(i + 2) for i in range(min(len(relevant), k)))
     return dcg / idcg if idcg > 0 else 0.0
 
 
 def map_at_k(recommended: List[int], relevant: Set[int], k: int) -> float:
-    """MAP@K = mean of precision at each relevant position"""
     if not relevant or not recommended:
         return 0.0
-
-    rec_k = recommended[:k]
-    hits = 0
-    sum_precision = 0.0
-
-    for i, item in enumerate(rec_k):
+    hits, sum_prec = 0, 0.0
+    for i, item in enumerate(recommended[:k]):
         if item in relevant:
             hits += 1
-            sum_precision += hits / (i + 1)
+            sum_prec += hits / (i + 1)
+    return sum_prec / min(len(relevant), k)
 
-    return sum_precision / min(len(relevant), k)
 
-
-def calculate_all_metrics(recommended: List[int], relevant: Set[int], k: int) -> Dict[str, float]:
-    """Calculate all metrics for a single prediction."""
+def all_metrics(recommended: List[int], relevant: Set[int], k: int) -> Dict[str, float]:
     prec = precision_at_k(recommended, relevant, k)
     rec = recall_at_k(recommended, relevant, k)
-
     return {
-        'precision': prec,
-        'recall': rec,
-        'f1': f1_at_k(prec, rec),
-        'hit_rate': hit_rate_at_k(recommended, relevant, k),
-        'mrr': mrr(recommended[:k], relevant),
-        'ndcg': ndcg_at_k(recommended, relevant, k),
-        'map': map_at_k(recommended, relevant, k)
+        "precision": prec,
+        "recall": rec,
+        "f1": f1_at_k(prec, rec),
+        "hit_rate": hit_rate_at_k(recommended, relevant, k),
+        "mrr": mrr_score(recommended[:k], relevant),
+        "ndcg": ndcg_at_k(recommended, relevant, k),
+        "map": map_at_k(recommended, relevant, k),
     }
 
 
 # =============================================================================
-# Data Preparation - FIXED
+# Diversity helpers
 # =============================================================================
 
-def prepare_evaluation_data(
-    ratings_df: pd.DataFrame,
-    min_train_items: int = 10,
-    min_test_items: int = 3,
-    test_ratio: float = 0.2,
-    relevance_threshold: float = 7.0,
-    leave_one_out: bool = False
-) -> Tuple[Dict[int, Dict[int, float]], Dict[int, Set[int]], List[int]]:
+
+def _parse_genres(genres_str: str) -> Set[str]:
+    if not genres_str:
+        return set()
+    return {g.strip().lower() for g in str(genres_str).split(",") if g.strip()}
+
+
+def diversity_metrics(
+    rec_ids: List[int],
+    anime_info: Dict[int, Dict],
+    all_corpus_genres: Set[str],
+) -> Dict[str, float]:
     """
-    Prepare train/test split for evaluation - FIXED VERSION.
+    Tính diversity metrics cho một list gợi ý.
 
-    FIX #1: Train set contains ALL interactions (positive + negative)
-            This is critical for CF/ALS to learn user preferences properly.
-
-    FIX #2: Test set contains ONLY relevant items (rating >= threshold)
-            We evaluate whether the model can predict items the user will LIKE.
-
-    FIX #3: Split is done per-user to ensure fair evaluation.
-
-    Args:
-        ratings_df: DataFrame with user_id, anime_id, rating
-        min_train_items: Minimum items in training set per user
-        min_test_items: Minimum relevant items in test set per user
-        test_ratio: Ratio of relevant items for test set
-        relevance_threshold: Rating threshold to consider item as "relevant"
-        leave_one_out: If True, use Leave-One-Out evaluation (1 item in test)
-
-    Returns:
-        user_train: Dict of user_id -> {anime_id: rating} (ALL interactions)
-        user_test: Dict of user_id -> set of anime_ids (relevant items only)
-        eval_users: List of user_ids eligible for evaluation
+    ILD   = 1 - mean(pairwise genre Jaccard) — cao = đa dạng
+    cov   = % genres unique trong kết quả / tổng genres corpus
+    entropy = Shannon entropy phân bố genre
     """
-    logger.info("Preparing evaluation data (FIXED logic)...")
-    logger.info(f"  - Relevance threshold: {relevance_threshold}")
-    logger.info(f"  - Leave-One-Out mode: {leave_one_out}")
+    if not rec_ids:
+        return {"ILD": 0.0, "genre_coverage": 0.0, "genre_entropy": 0.0}
 
-    user_train = {}  # user_id -> {anime_id: rating}
-    user_test = {}   # user_id -> set of test anime_ids (relevant only)
-    eval_users = []
+    genre_sets = []
+    gcounts: Dict[str, int] = {}
+    for aid in rec_ids:
+        gs = _parse_genres(anime_info.get(aid, {}).get("genres", ""))
+        genre_sets.append(gs)
+        for g in gs:
+            gcounts[g] = gcounts.get(g, 0) + 1
 
-    # Group by user
-    user_groups = ratings_df.groupby('user_id')
-
-    for user_id, group in user_groups:
-        # Get ALL user interactions (for training)
-        all_items = dict(zip(group['anime_id'], group['rating']))
-
-        # Get only relevant items (for test set selection)
-        relevant_items = group[group['rating'] >= relevance_threshold]['anime_id'].tolist()
-
-        # Skip users with insufficient data
-        if len(all_items) < min_train_items:
-            continue
-        if len(relevant_items) < min_test_items + 1:  # Need at least 1 for train
-            continue
-
-        # Shuffle relevant items for random split
-        np.random.shuffle(relevant_items)
-
-        if leave_one_out:
-            # Leave-One-Out: Put exactly 1 relevant item in test
-            test_items = set([relevant_items[0]])
-            # Train contains ALL items (including the test item's rating context)
-            # But we exclude test item from train for fair evaluation
-            train_items = {k: v for k, v in all_items.items() if k not in test_items}
-        else:
-            # Standard split: Put test_ratio of relevant items in test
-            n_test = max(min_test_items, int(len(relevant_items) * test_ratio))
-            n_test = min(n_test, len(relevant_items) - 1)  # Keep at least 1 for train
-
-            test_items = set(relevant_items[:n_test])
-            # Train contains ALL items except test items
-            train_items = {k: v for k, v in all_items.items() if k not in test_items}
-
-        # Verify we have enough data
-        if len(train_items) < min_train_items:
-            continue
-        if len(test_items) < (1 if leave_one_out else min_test_items):
-            continue
-
-        user_train[user_id] = train_items
-        user_test[user_id] = test_items
-        eval_users.append(user_id)
-
-    logger.info(f"Prepared {len(eval_users)} users for evaluation")
-    logger.info(f"  - Avg train items: {np.mean([len(v) for v in user_train.values()]):.1f}")
-    logger.info(f"  - Avg test items: {np.mean([len(v) for v in user_test.values()]):.1f}")
-
-    return user_train, user_test, eval_users
-
-
-def prepare_implicit_evaluation_data(
-    ratings_df: pd.DataFrame,
-    implicit_model: ALSImplicit,
-    min_train_items: int = 5,
-    min_test_items: int = 1,
-    test_ratio: float = 0.2
-) -> Tuple[Dict[int, Set[int]], Dict[int, Set[int]], List[int]]:
-    """
-    Prepare train/test split specifically for Implicit ALS evaluation.
-
-    KEY DIFFERENCE FROM EXPLICIT EVALUATION:
-    - No rating threshold (all interactions are "positive" implicit feedback)
-    - Only users that exist in the implicit model AND have valid indices are included
-    - Ground truth = any item the user interacted with
-
-    Args:
-        ratings_df: DataFrame with user_id, anime_id, rating
-        implicit_model: Trained ALSImplicit model (to get valid users)
-        min_train_items: Minimum items in training set per user
-        min_test_items: Minimum items in test set per user
-        test_ratio: Ratio of items for test set
-
-    Returns:
-        user_train: Dict of user_id -> set of training anime_ids
-        user_test: Dict of user_id -> set of test anime_ids
-        eval_users: List of user_ids eligible for evaluation
-    """
-    logger.info("Preparing IMPLICIT evaluation data...")
-
-    if implicit_model is None:
-        logger.error("Implicit model is None")
-        return {}, {}, []
-
-    # Get users and items from model
-    model_users = set(implicit_model.user_to_idx.keys())
-    model_items = set(implicit_model.anime_to_idx.keys())
-
-    # Determine actual factor dimensions (handle swapped factors)
-    n_users_in_mapping = len(implicit_model.user_to_idx)
-    n_items_in_mapping = len(implicit_model.anime_to_idx)
-
-    if implicit_model.user_factors.shape[0] == n_items_in_mapping:
-        # Factors are swapped - item_factors contains users
-        actual_n_users = implicit_model.item_factors.shape[0]
+    # ILD
+    n = len(genre_sets)
+    if n > 1:
+        pairs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = genre_sets[i], genre_sets[j]
+                if a or b:
+                    inter = len(a & b)
+                    union = len(a | b)
+                    pairs.append(inter / union if union > 0 else 0.0)
+        ild = 1.0 - float(np.mean(pairs)) if pairs else 0.0
     else:
-        actual_n_users = implicit_model.user_factors.shape[0]
+        ild = 0.0
 
-    logger.info(f"  Model has {len(model_users)} users in mapping, {actual_n_users} in factors")
-    logger.info(f"  Model has {len(model_items)} items")
+    # Coverage
+    all_rec_genres = set().union(*genre_sets) if genre_sets else set()
+    coverage = (
+        len(all_rec_genres) / len(all_corpus_genres) if all_corpus_genres else 0.0
+    )
 
-    user_train = {}  # user_id -> set of anime_ids
-    user_test = {}   # user_id -> set of anime_ids
-    eval_users = []
-
-    # Group ratings by user
-    user_groups = ratings_df.groupby('user_id')
-
-    for user_id, group in user_groups:
-        # Skip users not in implicit model
-        if user_id not in model_users:
-            continue
-
-        # Check if user index is within bounds
-        user_idx = implicit_model.user_to_idx[user_id]
-        if user_idx >= actual_n_users:
-            continue
-
-        # For implicit: ALL interactions are positive (rating > 0)
-        # Filter to items that exist in the model
-        user_items = group[group['rating'] > 0]['anime_id'].tolist()
-        user_items = [aid for aid in user_items if aid in model_items]
-
-        if len(user_items) < min_train_items + min_test_items:
-            continue
-
-        # Random split
-        np.random.shuffle(user_items)
-        n_test = max(min_test_items, int(len(user_items) * test_ratio))
-        n_test = min(n_test, len(user_items) - min_train_items)
-
-        test_items = set(user_items[:n_test])
-        train_items = set(user_items[n_test:])
-
-        if len(train_items) < min_train_items or len(test_items) < min_test_items:
-            continue
-
-        user_train[user_id] = train_items
-        user_test[user_id] = test_items
-        eval_users.append(user_id)
-
-    if eval_users:
-        logger.info(f"Prepared {len(eval_users)} users for implicit evaluation")
-        logger.info(f"  - Avg train items: {np.mean([len(v) for v in user_train.values()]):.1f}")
-        logger.info(f"  - Avg test items: {np.mean([len(v) for v in user_test.values()]):.1f}")
+    # Entropy
+    total = sum(gcounts.values())
+    if total > 0:
+        probs = np.array([c / total for c in gcounts.values()])
+        entropy = float(-np.sum(probs * np.log(probs + 1e-10)))
     else:
-        logger.warning("No users prepared for implicit evaluation!")
+        entropy = 0.0
 
-    return user_train, user_test, eval_users
+    return {
+        "ILD": round(ild, 4),
+        "genre_coverage": round(coverage, 4),
+        "genre_entropy": round(entropy, 4),
+    }
+
+
+def build_corpus_genres(anime_info: Dict[int, Dict]) -> Set[str]:
+    genres: Set[str] = set()
+    for info in anime_info.values():
+        genres |= _parse_genres(info.get("genres", ""))
+    return genres
 
 
 # =============================================================================
-# Content-Based Evaluation - FIXED
+# Aggregate results helper
 # =============================================================================
+
+
+def aggregate_results(
+    results_per_k: Dict[int, Dict[str, list]],
+    n_evaluated: int,
+    k_values: List[int],
+) -> Dict[str, Dict[str, float]]:
+    """Tính mean của mỗi metric, trả về dict {K=5: {metric: value}}."""
+    summary = {}
+    for k in k_values:
+        kd = results_per_k[k]
+        summary[f"K={k}"] = {
+            metric: float(np.mean(vals)) if vals else 0.0 for metric, vals in kd.items()
+        }
+        summary[f"K={k}"]["evaluated_users"] = n_evaluated
+    return summary
+
+
+# =============================================================================
+# 1. Content-Based Evaluation
+# =============================================================================
+
 
 def evaluate_content_model(
     content_model: ContentBasedRecommender,
@@ -412,41 +237,28 @@ def evaluate_content_model(
     eval_users: List[int],
     k_values: List[int],
     max_users: int = 500,
-    num_profile_items: int = 5
+    anime_info: Dict[int, Dict] = None,
+    corpus_genres: Set[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Evaluate Content-Based Recommender - FIXED VERSION.
+    Đánh giá Content-Based model.
 
-    FIX #2: Build user profile from MULTIPLE top-rated items, not just one.
-            This gives a more representative view of user preferences.
-
-    Strategy:
-    1. Get user's top-rated items from training set
-    2. Get recommendations for each item
-    3. Aggregate scores across all recommendations (voting/averaging)
-    4. Compare aggregated recommendations with test set
-
-    Args:
-        content_model: Trained ContentBasedRecommender
-        user_train: Dict of user_id -> {anime_id: rating}
-        user_test: Dict of user_id -> set of test anime_ids
-        eval_users: List of users to evaluate
-        k_values: List of K values for metrics
-        max_users: Maximum users to evaluate
-        num_profile_items: Number of top-rated items to use for profile
+    Dùng recommend_for_user() của model mới (tích hợp FAISS + user vector cache).
+    User vector được build từ toàn bộ ratings trong train set.
     """
-    logger.info("Evaluating Content-Based Model (FIXED - multi-item profile)...")
+    logger.info("Evaluating Content-Based model...")
 
     if content_model is None:
-        logger.warning("Content model not available")
+        logger.warning("Content model not available — skip")
         return {}
 
     results = {k: defaultdict(list) for k in k_values}
+    div_results = {k: defaultdict(list) for k in k_values}
     evaluated = 0
-    skipped_no_profile = 0
+    skipped_no_vec = 0
     skipped_no_recs = 0
 
-    sample_users = eval_users[:max_users] if len(eval_users) > max_users else eval_users
+    sample_users = eval_users[:max_users]
 
     for i, user_id in enumerate(sample_users):
         train_items = user_train.get(user_id, {})
@@ -456,89 +268,58 @@ def evaluate_content_model(
             continue
 
         try:
-            # FIX: Get TOP-RATED items to build user profile (not random)
-            sorted_items = sorted(train_items.items(), key=lambda x: x[1], reverse=True)
-            profile_items = [item_id for item_id, rating in sorted_items[:num_profile_items]]
+            # recommend_for_user dùng FAISS nếu có, fallback numpy
+            recs = content_model.recommend_for_user(
+                user_id=user_id,
+                user_ratings=train_items,
+                top_k=max(k_values) * 3,
+                exclude_ids=set(train_items.keys()),
+            )
 
-            if len(profile_items) == 0:
-                skipped_no_profile += 1
-                continue
-
-            # Aggregate recommendations from multiple profile items
-            item_scores = defaultdict(float)
-            item_counts = defaultdict(int)
-
-            for query_anime_id in profile_items:
-                try:
-                    recommendations = content_model.get_similar_anime(
-                        query_anime_id,
-                        top_k=max(k_values) * 2  # Get more to aggregate
-                    )
-
-                    if not recommendations:
-                        continue
-
-                    # Weight by user's rating of the query item
-                    query_rating = train_items.get(query_anime_id, 7.0)
-                    weight = query_rating / 10.0  # Normalize to [0, 1]
-
-                    for rec in recommendations:
-                        rec_id = rec['mal_id']
-                        # Skip items already in training set
-                        if rec_id in train_items:
-                            continue
-                        similarity = rec.get('similarity', 0.5)
-                        item_scores[rec_id] += similarity * weight
-                        item_counts[rec_id] += 1
-
-                except Exception:
-                    continue
-
-            if not item_scores:
+            if not recs:
                 skipped_no_recs += 1
                 continue
 
-            # Average scores and sort
-            avg_scores = {
-                item_id: score / item_counts[item_id]
-                for item_id, score in item_scores.items()
-            }
-            sorted_recs = sorted(avg_scores.items(), key=lambda x: x[1], reverse=True)
-            rec_ids = [item_id for item_id, score in sorted_recs]
+            rec_ids = [r["mal_id"] for r in recs if r["mal_id"] not in train_items]
 
-            # Calculate metrics
+            if not rec_ids:
+                skipped_no_recs += 1
+                continue
+
             for k in k_values:
-                metrics = calculate_all_metrics(rec_ids, test_items, k)
-                for metric, value in metrics.items():
-                    results[k][metric].append(value)
+                m = all_metrics(rec_ids, test_items, k)
+                for metric, val in m.items():
+                    results[k][metric].append(val)
+                if anime_info and corpus_genres:
+                    dm = diversity_metrics(rec_ids[:k], anime_info, corpus_genres)
+                    for metric, val in dm.items():
+                        div_results[k][metric].append(val)
 
             evaluated += 1
 
         except Exception as e:
-            logger.debug(f"Error evaluating user {user_id}: {e}")
+            logger.debug(f"Content user {user_id}: {e}")
             continue
 
         if (i + 1) % 100 == 0:
-            logger.info(f"  Content: {i + 1}/{len(sample_users)} processed, {evaluated} evaluated")
+            logger.info(f"  Content: {i+1}/{len(sample_users)}, evaluated={evaluated}")
 
-    logger.info(f"  Content evaluation: {evaluated} users evaluated")
-    logger.info(f"  Skipped (no profile): {skipped_no_profile}, (no recs): {skipped_no_recs}")
+    logger.info(
+        f"  Content done: {evaluated} users, skipped={skipped_no_vec+skipped_no_recs}"
+    )
 
-    # Aggregate results
-    summary = {}
+    # Merge diversity into results
     for k in k_values:
-        summary[f'K={k}'] = {
-            metric: np.mean(values) if values else 0.0
-            for metric, values in results[k].items()
-        }
-        summary[f'K={k}']['evaluated_users'] = evaluated
+        for metric, vals in div_results[k].items():
+            results[k][metric] = vals
 
-    return summary
+    return aggregate_results(results, evaluated, k_values)
 
 
 # =============================================================================
-# Collaborative Filtering Evaluation
+# 2. Collaborative Filtering Evaluation
 # =============================================================================
+
 
 def evaluate_collaborative_model(
     collab_model: MatrixFactorization,
@@ -546,24 +327,23 @@ def evaluate_collaborative_model(
     user_test: Dict[int, Set[int]],
     eval_users: List[int],
     k_values: List[int],
-    max_users: int = 500
+    max_users: int = 500,
+    anime_info: Dict[int, Dict] = None,
+    corpus_genres: Set[str] = None,
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Evaluate Collaborative Filtering Model.
-
-    Strategy: Get recommendations for each user, excluding training items.
-    """
-    logger.info("Evaluating Collaborative Filtering Model...")
+    """Đánh giá Collaborative Filtering (BPR / SVD / ALS explicit)."""
+    logger.info("Evaluating Collaborative Filtering model...")
 
     if collab_model is None:
-        logger.warning("Collaborative model not available")
+        logger.warning("Collaborative model not available — skip")
         return {}
 
     results = {k: defaultdict(list) for k in k_values}
+    div_results = {k: defaultdict(list) for k in k_values}
     evaluated = 0
     skipped_not_in_model = 0
 
-    sample_users = eval_users[:max_users] if len(eval_users) > max_users else eval_users
+    sample_users = eval_users[:max_users]
 
     for i, user_id in enumerate(sample_users):
         train_items = user_train.get(user_id, {})
@@ -572,61 +352,65 @@ def evaluate_collaborative_model(
         if not test_items:
             continue
 
-        try:
-            # Check if user exists in model
-            if hasattr(collab_model, 'user_to_idx'):
-                if user_id not in collab_model.user_to_idx:
-                    skipped_not_in_model += 1
-                    continue
+        # User phải có trong model
+        if (
+            hasattr(collab_model, "user_to_idx")
+            and user_id not in collab_model.user_to_idx
+        ):
+            skipped_not_in_model += 1
+            continue
 
-            recommendations = collab_model.recommend_for_user(
+        try:
+            recs = collab_model.recommend_for_user(
                 user_id,
-                top_k=max(k_values) + len(train_items),  # Get extra to filter
+                top_k=max(k_values) * 3,
                 exclude_rated=True,
                 rated_items=set(train_items.keys()),
             )
 
-            if not recommendations:
+            if not recs:
                 continue
 
-            # Filter out training items
-            rec_ids = [r['mal_id'] for r in recommendations if r['mal_id'] not in train_items]
-            rec_ids = rec_ids[:max(k_values)]
+            rec_ids = [r["mal_id"] for r in recs if r["mal_id"] not in train_items]
 
             if not rec_ids:
                 continue
 
             for k in k_values:
-                metrics = calculate_all_metrics(rec_ids, test_items, k)
-                for metric, value in metrics.items():
-                    results[k][metric].append(value)
+                m = all_metrics(rec_ids, test_items, k)
+                for metric, val in m.items():
+                    results[k][metric].append(val)
+                if anime_info and corpus_genres:
+                    dm = diversity_metrics(rec_ids[:k], anime_info, corpus_genres)
+                    for metric, val in dm.items():
+                        div_results[k][metric].append(val)
 
             evaluated += 1
 
         except Exception as e:
-            logger.debug(f"Error evaluating user {user_id}: {e}")
+            logger.debug(f"Collaborative user {user_id}: {e}")
             continue
 
         if (i + 1) % 100 == 0:
-            logger.info(f"  Collaborative: {i + 1}/{len(sample_users)} processed")
+            logger.info(
+                f"  Collaborative: {i+1}/{len(sample_users)}, evaluated={evaluated}"
+            )
 
-    logger.info(f"  Collaborative evaluation: {evaluated} users")
-    logger.info(f"  Skipped (not in model): {skipped_not_in_model}")
+    logger.info(
+        f"  Collaborative done: {evaluated} users, not_in_model={skipped_not_in_model}"
+    )
 
-    summary = {}
     for k in k_values:
-        summary[f'K={k}'] = {
-            metric: np.mean(values) if values else 0.0
-            for metric, values in results[k].items()
-        }
-        summary[f'K={k}']['evaluated_users'] = evaluated
+        for metric, vals in div_results[k].items():
+            results[k][metric] = vals
 
-    return summary
+    return aggregate_results(results, evaluated, k_values)
 
 
 # =============================================================================
-# Implicit ALS Evaluation - FIXED FOR IMPLICIT FEEDBACK
+# 3. Implicit ALS Evaluation
 # =============================================================================
+
 
 def evaluate_implicit_model(
     implicit_model: ALSImplicit,
@@ -634,141 +418,117 @@ def evaluate_implicit_model(
     user_test: Dict[int, Set[int]],
     eval_users: List[int],
     k_values: List[int],
-    max_users: int = 500
+    max_users: int = 500,
+    anime_info: Dict[int, Dict] = None,
+    corpus_genres: Set[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Evaluate the implicit model against the single persisted split.
+    Đánh giá ALS Implicit model.
+
+    ALS dùng implicit feedback (hành vi xem) → không cần rating threshold
+    để xác định "relevant". Test items là items user có rating > 0
+    (đã tương tác) nhưng model chưa thấy.
     """
-    logger.info("Evaluating Implicit Feedback Model using the persisted split...")
+    logger.info("Evaluating ALS Implicit model...")
 
     if implicit_model is None:
-        logger.warning("Implicit model not available")
+        logger.warning("Implicit model not available — skip")
         return {}
 
-    # Validate model has required attributes
     if not implicit_model.user_to_idx or not implicit_model.anime_to_idx:
-        logger.error("Implicit model missing user_to_idx or anime_to_idx mappings")
+        logger.error("Implicit model thiếu mappings")
         return {}
 
     if implicit_model.user_factors is None or implicit_model.item_factors is None:
-        logger.error("Implicit model factors not initialized")
+        logger.error("Implicit model factors chưa được train")
         return {}
 
-    n_model_users = implicit_model.user_factors.shape[0]
-    n_model_items = implicit_model.item_factors.shape[0]
+    # Xác định kích thước factor thực sự (tránh swapped factors)
+    n_model_users = len(implicit_model.user_to_idx)
+    uf_rows = implicit_model.user_factors.shape[0]
+    actual_n_users = (
+        uf_rows if uf_rows == n_model_users else implicit_model.item_factors.shape[0]
+    )
 
-    logger.info(f"  Model dimensions: {n_model_users} users x {n_model_items} items")
-    logger.info(f"  Mappings: {len(implicit_model.user_to_idx)} users, {len(implicit_model.anime_to_idx)} items")
-
-    if not eval_users:
-        logger.error("No users available for implicit evaluation")
-        return {}
+    logger.info(
+        f"  ALS: {n_model_users} users, {len(implicit_model.anime_to_idx)} items"
+    )
 
     results = {k: defaultdict(list) for k in k_values}
+    div_results = {k: defaultdict(list) for k in k_values}
     evaluated = 0
+    skip_oob = 0
+    skip_norec = 0
 
-    # Track skip reasons
-    skip_reasons = {
-        'index_out_of_bounds': 0,
-        'no_test_items': 0,
-        'no_recommendations': 0,
-        'exception': 0
-    }
-
-    # Sample users
-    sample_users = eval_users[:max_users] if len(eval_users) > max_users else eval_users
-    logger.info(f"  Evaluating {len(sample_users)} users")
+    sample_users = eval_users[:max_users]
 
     for i, user_id in enumerate(sample_users):
         train_items = set(user_train.get(user_id, {}).keys())
         test_items = user_test.get(user_id, set())
 
         if not test_items:
-            skip_reasons['no_test_items'] += 1
+            continue
+
+        if user_id not in implicit_model.user_to_idx:
+            continue
+
+        user_idx = implicit_model.user_to_idx[user_id]
+        if user_idx >= actual_n_users:
+            skip_oob += 1
             continue
 
         try:
-            # Check user index bounds
-            user_idx = implicit_model.user_to_idx[user_id]
-            if user_idx >= n_model_users:
-                skip_reasons['index_out_of_bounds'] += 1
-                logger.debug(f"User {user_id} index {user_idx} >= {n_model_users}")
-                continue
-
-            # Get recommendations using model's recommend_for_user
-            recommendations = implicit_model.recommend_for_user(
+            recs = implicit_model.recommend_for_user(
                 user_id,
-                top_k=max(k_values) * 3,  # Get extra to account for filtering
+                top_k=max(k_values) * 3,
                 exclude_known=True,
-                known_items=train_items
+                known_items=train_items,
+                use_diversity=False,  # diversity đánh giá riêng bên dưới
             )
 
-            if not recommendations:
-                skip_reasons['no_recommendations'] += 1
+            if not recs:
+                skip_norec += 1
                 continue
 
-            # Extract anime_ids from recommendations
-            rec_anime_ids = []
-            for rec in recommendations:
-                anime_id = rec.get('mal_id')
-                if anime_id is not None and anime_id not in train_items:
-                    rec_anime_ids.append(anime_id)
+            rec_ids = [r["mal_id"] for r in recs if r["mal_id"] not in train_items]
 
-            if not rec_anime_ids:
-                skip_reasons['no_recommendations'] += 1
+            if not rec_ids:
+                skip_norec += 1
                 continue
 
-            # Calculate metrics - for implicit, all test interactions are relevant
             for k in k_values:
-                rec_k = rec_anime_ids[:k]
-                metrics = calculate_all_metrics(rec_k, test_items, k)
-                for metric, value in metrics.items():
-                    results[k][metric].append(value)
+                m = all_metrics(rec_ids, test_items, k)
+                for metric, val in m.items():
+                    results[k][metric].append(val)
+                if anime_info and corpus_genres:
+                    dm = diversity_metrics(rec_ids[:k], anime_info, corpus_genres)
+                    for metric, val in dm.items():
+                        div_results[k][metric].append(val)
 
             evaluated += 1
 
         except Exception as e:
-            skip_reasons['exception'] += 1
-            logger.debug(f"Exception for user {user_id}: {e}")
+            logger.debug(f"Implicit user {user_id}: {e}")
             continue
 
         if (i + 1) % 100 == 0:
-            logger.info(f"  Implicit: {i + 1}/{len(sample_users)} processed, {evaluated} evaluated")
+            logger.info(f"  Implicit: {i+1}/{len(sample_users)}, evaluated={evaluated}")
 
-    # Log skip summary
-    logger.info(f"  Implicit evaluation complete:")
-    logger.info(f"    Evaluated: {evaluated}")
-    logger.info(f"    Skipped (index OOB): {skip_reasons['index_out_of_bounds']}")
-    logger.info(f"    Skipped (no test items): {skip_reasons['no_test_items']}")
-    logger.info(f"    Skipped (no recs): {skip_reasons['no_recommendations']}")
-    logger.info(f"    Skipped (exception): {skip_reasons['exception']}")
+    logger.info(
+        f"  Implicit done: {evaluated} users, " f"oob={skip_oob}, no_rec={skip_norec}"
+    )
 
-    # Build summary
-    summary = {}
     for k in k_values:
-        if results[k]['hit_rate']:  # Check if we have any results
-            summary[f'K={k}'] = {
-                metric: np.mean(values) if values else 0.0
-                for metric, values in results[k].items()
-            }
-        else:
-            summary[f'K={k}'] = {
-                'precision': 0.0,
-                'recall': 0.0,
-                'f1': 0.0,
-                'hit_rate': 0.0,
-                'mrr': 0.0,
-                'ndcg': 0.0,
-                'map': 0.0
-            }
-        summary[f'K={k}']['evaluated_users'] = evaluated
+        for metric, vals in div_results[k].items():
+            results[k][metric] = vals
 
-    return summary
+    return aggregate_results(results, evaluated, k_values)
 
 
 # =============================================================================
-# Popularity Model Evaluation
+# 4. Popularity Evaluation
 # =============================================================================
+
 
 def evaluate_popularity_model(
     popularity_model: PopularityModel,
@@ -776,35 +536,37 @@ def evaluate_popularity_model(
     user_test: Dict[int, Set[int]],
     eval_users: List[int],
     k_values: List[int],
-    max_users: int = 500
+    max_users: int = 500,
+    anime_info: Dict[int, Dict] = None,
+    corpus_genres: Set[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Evaluate Popularity-Based Model (baseline).
+    Đánh giá Popularity baseline.
 
-    Note: Popular items are the same for all users, but we exclude
-    items already in each user's training set for fair comparison.
+    Top anime phổ biến giống nhau với mọi user — chỉ exclude items user đã xem.
     """
-    logger.info("Evaluating Popularity-Based Model...")
+    logger.info("Evaluating Popularity model (baseline)...")
 
     if popularity_model is None:
-        logger.warning("Popularity model not available")
+        logger.warning("Popularity model not available — skip")
+        return {}
+
+    # Lấy popular items một lần
+    try:
+        popular_recs = popularity_model.get_popular(
+            top_k=max(k_values) * 5,
+            popularity_type="top_rated",
+        )
+        all_popular_ids = [r["mal_id"] for r in popular_recs]
+    except Exception as e:
+        logger.error(f"Không lấy được popular recs: {e}")
         return {}
 
     results = {k: defaultdict(list) for k in k_values}
+    div_results = {k: defaultdict(list) for k in k_values}
     evaluated = 0
 
-    sample_users = eval_users[:max_users] if len(eval_users) > max_users else eval_users
-
-    # Get popular items once
-    try:
-        popular_recs = popularity_model.get_popular(
-            top_k=max(k_values) * 5,  # Get extra for filtering
-            popularity_type='top_rated'
-        )
-        all_popular_ids = [r['mal_id'] for r in popular_recs]
-    except Exception as e:
-        logger.error(f"Failed to get popular recommendations: {e}")
-        return {}
+    sample_users = eval_users[:max_users]
 
     for i, user_id in enumerate(sample_users):
         train_items = user_train.get(user_id, {})
@@ -813,69 +575,68 @@ def evaluate_popularity_model(
         if not test_items:
             continue
 
-        # Filter out user's training items
         rec_ids = [pid for pid in all_popular_ids if pid not in train_items]
-        rec_ids = rec_ids[:max(k_values)]
 
         if not rec_ids:
             continue
 
         for k in k_values:
-            metrics = calculate_all_metrics(rec_ids, test_items, k)
-            for metric, value in metrics.items():
-                results[k][metric].append(value)
+            m = all_metrics(rec_ids, test_items, k)
+            for metric, val in m.items():
+                results[k][metric].append(val)
+            if anime_info and corpus_genres:
+                dm = diversity_metrics(rec_ids[:k], anime_info, corpus_genres)
+                for metric, val in dm.items():
+                    div_results[k][metric].append(val)
 
         evaluated += 1
 
-        if (i + 1) % 100 == 0:
-            logger.info(f"  Popularity: {i + 1}/{len(sample_users)} processed")
+    logger.info(f"  Popularity done: {evaluated} users")
 
-    logger.info(f"  Popularity evaluation: {evaluated} users")
-
-    summary = {}
     for k in k_values:
-        summary[f'K={k}'] = {
-            metric: np.mean(values) if values else 0.0
-            for metric, values in results[k].items()
-        }
-        summary[f'K={k}']['evaluated_users'] = evaluated
+        for metric, vals in div_results[k].items():
+            results[k][metric] = vals
 
-    return summary
+    return aggregate_results(results, evaluated, k_values)
 
 
 # =============================================================================
-# Hybrid Model Evaluation - FIXED
+# 5. Hybrid / LearnedHybrid Evaluation (dùng chung 1 hàm)
 # =============================================================================
+
 
 def evaluate_hybrid_model(
-    hybrid_engine: HybridEngine,
+    hybrid_engine,
     user_train: Dict[int, Dict[int, float]],
     user_test: Dict[int, Set[int]],
     eval_users: List[int],
     k_values: List[int],
-    max_users: int = 500
+    max_users: int = 500,
+    model_label: str = "Hybrid",
+    anime_info: Dict[int, Dict] = None,
+    corpus_genres: Set[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
-    Evaluate Hybrid Engine - FIXED VERSION.
+    Đánh giá HybridEngine hoặc LearnedHybridEngine (interface giống nhau).
 
-    FIX #4: Ensure consistent ID space and proper exclusion of watched items.
-
-    The hybrid model combines multiple sub-models, so we must ensure:
-    1. All sub-models use the same ID space (anime_id)
-    2. Training items are properly excluded
-    3. Cold-start users are handled gracefully
+    Với mỗi user:
+      1. set_user_history(train ratings) → engine chỉ thấy train data
+      2. recommend_for_user(exclude_watched=True)
+      3. So sánh với test items
     """
-    logger.info("Evaluating Hybrid Engine (FIXED - consistent ID space)...")
+    logger.info(f"Evaluating {model_label}...")
 
     if hybrid_engine is None:
-        logger.warning("Hybrid engine not available")
+        logger.warning(f"{model_label} not available — skip")
         return {}
 
     results = {k: defaultdict(list) for k in k_values}
+    div_results = {k: defaultdict(list) for k in k_values}
     evaluated = 0
-    skipped_cold_start = 0
+    skipped_no_recs = 0
+    skipped_cold = 0
 
-    sample_users = eval_users[:max_users] if len(eval_users) > max_users else eval_users
+    sample_users = eval_users[:max_users]
 
     for i, user_id in enumerate(sample_users):
         train_items = user_train.get(user_id, {})
@@ -885,365 +646,586 @@ def evaluate_hybrid_model(
             continue
 
         try:
-            # Ensure the hybrid engine only sees the user's training history.
+            # Quan trọng: chỉ cấp train data cho engine, không để lộ test
             hybrid_engine.set_user_history(
                 user_id,
                 ratings=train_items,
                 watched=set(train_items.keys()),
             )
 
-            # Get recommendations with exclude_watched=True
-            recommendations = hybrid_engine.recommend_for_user(
+            recs = hybrid_engine.recommend_for_user(
                 user_id,
-                top_k=max(k_values) + len(train_items),
-                exclude_watched=True
+                top_k=max(k_values) * 3,
+                exclude_watched=True,
             )
 
-            if not recommendations:
-                # Try without exclusion for cold-start users
-                recommendations = hybrid_engine.recommend_for_user(
+            # Cold-start fallback
+            if not recs:
+                recs = hybrid_engine.recommend_for_user(
                     user_id,
                     top_k=max(k_values) * 2,
-                    exclude_watched=False
+                    exclude_watched=False,
                 )
-                if not recommendations:
-                    skipped_cold_start += 1
+                if not recs:
+                    skipped_cold += 1
                     continue
 
-            # FIX: Ensure anime_ids and filter training items
-            rec_ids = []
-            for rec in recommendations:
-                anime_id = rec.get('mal_id') or rec.get('anime_id')
-                if anime_id and anime_id not in train_items:
-                    rec_ids.append(anime_id)
-
-            rec_ids = rec_ids[:max(k_values)]
+            rec_ids = [r.get("mal_id") or r.get("anime_id") for r in recs]
+            rec_ids = [aid for aid in rec_ids if aid and aid not in train_items]
 
             if not rec_ids:
+                skipped_no_recs += 1
                 continue
 
             for k in k_values:
-                metrics = calculate_all_metrics(rec_ids, test_items, k)
-                for metric, value in metrics.items():
-                    results[k][metric].append(value)
+                m = all_metrics(rec_ids, test_items, k)
+                for metric, val in m.items():
+                    results[k][metric].append(val)
+                if anime_info and corpus_genres:
+                    dm = diversity_metrics(rec_ids[:k], anime_info, corpus_genres)
+                    for metric, val in dm.items():
+                        div_results[k][metric].append(val)
 
             evaluated += 1
 
         except Exception as e:
-            logger.debug(f"Error evaluating user {user_id}: {e}")
+            logger.debug(f"{model_label} user {user_id}: {e}")
             continue
 
         if (i + 1) % 100 == 0:
-            logger.info(f"  Hybrid: {i + 1}/{len(sample_users)} processed, {evaluated} evaluated")
+            logger.info(
+                f"  {model_label}: {i+1}/{len(sample_users)}, evaluated={evaluated}"
+            )
 
-    logger.info(f"  Hybrid evaluation: {evaluated} users")
-    if skipped_cold_start > 0:
-        logger.info(f"  Skipped (cold start): {skipped_cold_start}")
+    logger.info(
+        f"  {model_label} done: {evaluated} users, "
+        f"cold={skipped_cold}, no_recs={skipped_no_recs}"
+    )
 
-    summary = {}
     for k in k_values:
-        summary[f'K={k}'] = {
-            metric: np.mean(values) if values else 0.0
-            for metric, values in results[k].items()
-        }
-        summary[f'K={k}']['evaluated_users'] = evaluated
+        for metric, vals in div_results[k].items():
+            results[k][metric] = vals
 
-    return summary
+    return aggregate_results(results, evaluated, k_values)
 
 
 # =============================================================================
-# Reporting Functions
+# Reporting
 # =============================================================================
 
-def print_model_results(model_name: str, results: Dict[str, Dict[str, float]]):
-    """Print results for a single model."""
+METRIC_DISPLAY_ORDER = [
+    "precision",
+    "recall",
+    "f1",
+    "hit_rate",
+    "mrr",
+    "ndcg",
+    "map",
+    "ILD",
+    "genre_coverage",
+    "genre_entropy",
+]
+
+MODEL_DISPLAY_ORDER = [
+    "Content",
+    "Collaborative",
+    "Implicit",
+    "Popularity",
+    "Hybrid",
+    "LearnedHybrid",
+]
+
+
+def _fmt(val) -> str:
+    if isinstance(val, float):
+        return f"{val:.4f}"
+    return str(val)
+
+
+def print_model_results(model_name: str, results: Dict[str, Dict[str, float]]) -> None:
     if not results:
-        print(f"\n{model_name}: No results available")
+        print(f"\n{model_name}: No results")
         return
-
-    print(f"\n{'=' * 60}")
-    print(f"{model_name} Results")
-    print('=' * 60)
-
-    for k_key, metrics in results.items():
-        print(f"\n  {k_key}:")
-        print(f"    {'Metric':<12} {'Value':>10}")
-        print(f"    {'-' * 24}")
-        for metric, value in metrics.items():
-            if metric != 'evaluated_users':
-                print(f"    {metric:<12} {value:>10.4f}")
-        print(f"    {'evaluated':<12} {metrics.get('evaluated_users', 0):>10}")
+    print(f"\n{'=' * 65}")
+    print(f"  {model_name}")
+    print(f"{'=' * 65}")
+    for k_key, metrics in sorted(results.items()):
+        n = metrics.get("evaluated_users", 0)
+        print(f"\n  {k_key}  (evaluated_users={n})")
+        print(f"  {'Metric':<18} {'Value':>10}")
+        print(f"  {'-' * 30}")
+        for metric in METRIC_DISPLAY_ORDER:
+            if metric in metrics:
+                print(f"  {metric:<18} {_fmt(metrics[metric]):>10}")
 
 
-def print_comparison_table(all_results: Dict[str, Dict], k: int):
-    """Print comparison table for all models at specific K."""
-    print(f"\n{'=' * 85}")
-    print(f"Model Comparison at K={k}")
-    print('=' * 85)
+def print_comparison_table(
+    all_results: Dict[str, Dict],
+    k: int,
+    metrics: List[str] = None,
+) -> None:
+    if metrics is None:
+        metrics = ["precision", "recall", "f1", "hit_rate", "mrr", "ndcg", "map"]
 
-    metrics = ['precision', 'recall', 'f1', 'hit_rate', 'mrr', 'ndcg', 'map']
+    k_key = f"K={k}"
+    col_w = 10
+    name_w = 16
 
-    # Header
-    header = f"{'Model':<15}"
-    for metric in metrics:
-        header += f"{metric:<10}"
-    header += f"{'users':>8}"
+    print(f"\n{'=' * (name_w + col_w * len(metrics) + 8)}")
+    print(f"  Comparison @ K={k}")
+    print(f"{'=' * (name_w + col_w * len(metrics) + 8)}")
+
+    header = f"  {'Model':<{name_w}}"
+    for m in metrics:
+        header += f"{m:>{col_w}}"
     print(header)
-    print('-' * 85)
+    print(f"  {'-' * (name_w + col_w * len(metrics))}")
 
-    # Each model
-    model_order = ['Content', 'Collaborative', 'Implicit', 'Popularity', 'Hybrid']
-    for model_name in model_order:
+    for model_name in MODEL_DISPLAY_ORDER:
         if model_name not in all_results:
             continue
-
-        model_results = all_results[model_name]
-        k_key = f'K={k}'
-
-        if k_key not in model_results:
-            continue
-
-        row = f"{model_name:<15}"
-        for metric in metrics:
-            value = model_results[k_key].get(metric, 0)
-            row += f"{value:<10.4f}"
-        row += f"{model_results[k_key].get('evaluated_users', 0):>8}"
+        row_data = all_results[model_name].get(k_key, {})
+        row = f"  {model_name:<{name_w}}"
+        for m in metrics:
+            val = row_data.get(m, 0.0)
+            row += f"{val:>{col_w}.4f}"
         print(row)
 
-    print('=' * 85)
+    print(f"{'=' * (name_w + col_w * len(metrics) + 8)}")
 
 
-def find_best_model(all_results: Dict[str, Dict], k: int, metric: str = 'ndcg'):
-    """Find the best model for a specific metric."""
-    best_model = None
-    best_value = -1
+def print_diversity_table(all_results: Dict[str, Dict], k: int) -> None:
+    k_key = f"K={k}"
+    div_metrics = ["ILD", "genre_coverage", "genre_entropy"]
+    col_w = 16
+    name_w = 16
 
-    k_key = f'K={k}'
+    # Check if any model has diversity metrics
+    has_div = any(
+        div_metrics[0] in all_results.get(m, {}).get(k_key, {})
+        for m in MODEL_DISPLAY_ORDER
+    )
+    if not has_div:
+        return
 
+    print(f"\n  Diversity @ K={k}")
+    print(f"  {'-' * (name_w + col_w * len(div_metrics))}")
+    header = f"  {'Model':<{name_w}}"
+    for m in div_metrics:
+        header += f"{m:>{col_w}}"
+    print(header)
+    print(f"  {'-' * (name_w + col_w * len(div_metrics))}")
+
+    for model_name in MODEL_DISPLAY_ORDER:
+        if model_name not in all_results:
+            continue
+        row_data = all_results[model_name].get(k_key, {})
+        if not any(m in row_data for m in div_metrics):
+            continue
+        row = f"  {model_name:<{name_w}}"
+        for m in div_metrics:
+            val = row_data.get(m, 0.0)
+            row += f"{val:>{col_w}.4f}"
+        print(row)
+
+
+def find_best_model(
+    all_results: Dict[str, Dict], k: int, metric: str = "ndcg"
+) -> Tuple[Optional[str], float]:
+    k_key = f"K={k}"
+    best_model, best_val = None, -1.0
     for model_name, results in all_results.items():
-        if k_key in results:
-            value = results[k_key].get(metric, 0)
-            if value > best_value:
-                best_value = value
-                best_model = model_name
-
-    return best_model, best_value
+        val = results.get(k_key, {}).get(metric, 0.0)
+        if val > best_val:
+            best_val = val
+            best_model = model_name
+    return best_model, best_val
 
 
 # =============================================================================
-# Main Function
+# Main
 # =============================================================================
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Individual Recommendation Models")
-    parser.add_argument("--sample-users", type=int, default=500, help="Number of users to sample")
-    parser.add_argument("--k", type=int, nargs='+', default=[5, 10, 20], help="K values for evaluation")
-    parser.add_argument("--output", type=str, default="model_evaluation_results.json", help="Output file")
-    parser.add_argument("--skip-content", action="store_true", help="Skip content model evaluation")
-    parser.add_argument("--skip-collaborative", action="store_true", help="Skip collaborative model evaluation")
-    parser.add_argument("--skip-implicit", action="store_true", help="Skip implicit model evaluation")
-    parser.add_argument("--skip-popularity", action="store_true", help="Skip popularity model evaluation")
-    parser.add_argument("--skip-hybrid", action="store_true", help="Skip hybrid model evaluation")
+    parser = argparse.ArgumentParser(description="Evaluate all recommendation models")
+    parser.add_argument(
+        "--sample-users",
+        type=int,
+        default=500,
+        help="Số user để evaluate (default: 500)",
+    )
+    parser.add_argument(
+        "--k",
+        type=int,
+        nargs="+",
+        default=[5, 10, 20],
+        help="Các giá trị K (default: 5 10 20)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="model_evaluation_results.json",
+        help="File lưu kết quả JSON",
+    )
     parser.add_argument(
         "--split-path",
         type=str,
         default=str(SPLITS_DIR / "ratings_user_split.pkl"),
-        help="Path to the persisted train/eval split artifact created before training",
+        help="Path tới split artifact",
+    )
+
+    # Skip flags
+    parser.add_argument("--skip-content", action="store_true")
+    parser.add_argument("--skip-collaborative", action="store_true")
+    parser.add_argument("--skip-implicit", action="store_true")
+    parser.add_argument("--skip-popularity", action="store_true")
+    parser.add_argument(
+        "--skip-hybrid",
+        action="store_true",
+        help="Skip HybridEngine (hard-coded weights)",
+    )
+    parser.add_argument(
+        "--skip-learned-hybrid",
+        action="store_true",
+        help="Skip LearnedHybridEngine (meta-model)",
+    )
+    parser.add_argument(
+        "--only-learned-hybrid",
+        action="store_true",
+        help="Chỉ evaluate LearnedHybrid (bỏ qua tất cả model khác)",
+    )
+    parser.add_argument(
+        "--no-diversity",
+        action="store_true",
+        help="Bỏ qua tính diversity metrics (nhanh hơn)",
     )
 
     args = parser.parse_args()
 
+    # --only-learned-hybrid shortcut
+    if args.only_learned_hybrid:
+        args.skip_content = args.skip_collaborative = args.skip_implicit = True
+        args.skip_popularity = args.skip_hybrid = True
+        args.skip_learned_hybrid = False
+
     total_start = time.time()
 
-    print("=" * 60)
-    print("ANIME RECOMMENDATION MODELS - EVALUATION (FIXED)")
-    print("=" * 60)
-    print("\nFIXES APPLIED:")
-    print("  1. A single persisted split is created before training")
-    print("  2. Models only train on user_train interactions")
-    print("  3. Evaluation only measures held-out user_test interactions")
-    print("  4. All models share the exact same split artifact")
-    print("=" * 60)
+    print("=" * 70)
+    print("  ANIME RECOMMENDATION SYSTEM — FULL EVALUATION")
+    print("=" * 70)
+    print(f"  Sample users : {args.sample_users}")
+    print(f"  K values     : {args.k}")
+    print(f"  Split path   : {args.split_path}")
+    print(f"  Diversity    : {'OFF' if args.no_diversity else 'ON'}")
+    print("=" * 70)
 
-    # =========================================================================
-    # Load Models
-    # =========================================================================
-    print("\n[1/3] Loading Trained Models...")
-    print("-" * 40)
+    # ─────────────────────────────────────────────────────────────────────
+    # Load split artifact
+    # ─────────────────────────────────────────────────────────────────────
+    print("\n[1/3] Loading split artifact...")
+    split_path = Path(args.split_path)
+    if not split_path.exists():
+        print(f"  ERROR: Split not found at {split_path}")
+        print("  Run train.py first to create the split.")
+        return
 
+    split_artifact = load_ratings_user_split(split_path)
+    user_train = split_artifact.user_train
+    user_test = split_artifact.user_test
+    eval_users = list(split_artifact.eval_users)
+
+    # Sample users deterministcially
+    if len(eval_users) > args.sample_users:
+        rng = np.random.default_rng(
+            int(split_artifact.metadata.get("random_state", eval_config.random_state))
+        )
+        eval_users = list(rng.choice(eval_users, args.sample_users, replace=False))
+
+    print(
+        f"  Train interactions : {split_artifact.metadata.get('train_interactions', 'N/A')}"
+    )
+    print(
+        f"  Test interactions  : {split_artifact.metadata.get('test_interactions', 'N/A')}"
+    )
+    print(f"  Eval users (total) : {len(split_artifact.eval_users)}")
+    print(f"  Eval users (used)  : {len(eval_users)}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Load models
+    # ─────────────────────────────────────────────────────────────────────
+    print("\n[2/3] Loading models...")
+
+    # Sub-models lưu trong saved_models/hybrid/
     model_path = MODELS_DIR / "hybrid"
+    # LearnedHybrid lưu trong saved_models/learned_hybrid/
+    learned_path = MODELS_DIR / "learned_hybrid"
 
     content_model = None
     collaborative_model = None
     implicit_model = None
     popularity_model = None
     hybrid_engine = None
+    learned_engine = None
 
-    # Load each model
     if not args.skip_content:
         try:
             content_model = ContentBasedRecommender()
             content_model.load(model_path / "content_model.pkl")
-            print("  [OK] Content-Based Model loaded")
+            print("  [OK] Content-Based model")
         except Exception as e:
-            print(f"  [SKIP] Content-Based Model: {e}")
+            print(f"  [SKIP] Content-Based: {e}")
 
     if not args.skip_collaborative:
         try:
             collaborative_model = MatrixFactorization()
             collaborative_model.load(model_path / "collaborative_model.pkl")
-            print("  [OK] Collaborative Filtering Model loaded")
+            print("  [OK] Collaborative (MatrixFactorization/BPR) model")
         except Exception as e:
-            print(f"  [SKIP] Collaborative Filtering Model: {e}")
+            print(f"  [SKIP] Collaborative: {e}")
 
     if not args.skip_implicit:
         try:
             implicit_model = ALSImplicit()
             implicit_model.load(model_path / "implicit_model.pkl")
-            print("  [OK] Implicit Feedback Model loaded")
+            print("  [OK] Implicit ALS model")
         except Exception as e:
-            print(f"  [SKIP] Implicit Feedback Model: {e}")
+            print(f"  [SKIP] Implicit: {e}")
 
     if not args.skip_popularity:
         try:
             popularity_model = PopularityModel()
             popularity_model.load(model_path / "popularity_model.pkl")
-            print("  [OK] Popularity Model loaded")
+            print("  [OK] Popularity model")
         except Exception as e:
-            print(f"  [SKIP] Popularity Model: {e}")
+            print(f"  [SKIP] Popularity: {e}")
 
     if not args.skip_hybrid:
         try:
+            # __init__.py mới export LearnedHybridEngine as HybridEngine
+            # Nếu vẫn muốn load HybridEngine gốc, dùng import trực tiếp
+            from models.hybrid.hybrid_engine import HybridEngine
+
             hybrid_engine = HybridEngine()
             hybrid_engine.load(model_path)
-            print("  [OK] Hybrid Engine loaded")
+            print("  [OK] HybridEngine (hard-coded weights)")
         except Exception as e:
-            print(f"  [SKIP] Hybrid Engine: {e}")
+            print(f"  [SKIP] HybridEngine: {e}")
 
-    # =========================================================================
-    # Load Split
-    # =========================================================================
-    print("\n[2/3] Loading Persisted Split...")
+    if not args.skip_learned_hybrid:
+        try:
+            from models.hybrid.learned_hybrid import LearnedHybridEngine
+
+            learned_engine = LearnedHybridEngine()
+            if learned_path.exists():
+                learned_engine.load(learned_path)
+                meta_trained = learned_engine._meta_trained
+                print(f"  [OK] LearnedHybridEngine (meta_trained={meta_trained})")
+                if not meta_trained:
+                    print(
+                        "       ⚠️  Meta-model chưa train — sẽ dùng fallback weighted sum"
+                    )
+            else:
+                print(f"  [SKIP] LearnedHybrid: {learned_path} không tồn tại")
+                print("         Chạy train.py trước để train LearnedHybrid")
+                learned_engine = None
+        except Exception as e:
+            print(f"  [SKIP] LearnedHybrid: {e}")
+            learned_engine = None
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Build anime_info và corpus genres cho diversity metrics
+    # ─────────────────────────────────────────────────────────────────────
+    anime_info: Dict[int, Dict] = {}
+    corpus_genres: Set[str] = set()
+
+    if not args.no_diversity:
+        # Lấy anime_info từ engine nào có sẵn
+        for eng in [learned_engine, hybrid_engine]:
+            if eng is not None and hasattr(eng, "_anime_info") and eng._anime_info:
+                anime_info = eng._anime_info
+                corpus_genres = build_corpus_genres(anime_info)
+                print(
+                    f"  Anime info loaded: {len(anime_info)} anime, "
+                    f"{len(corpus_genres)} genres (for diversity)"
+                )
+                break
+        if not anime_info:
+            print("  ⚠️  Không load được anime_info — diversity metrics sẽ bị bỏ qua")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Evaluate
+    # ─────────────────────────────────────────────────────────────────────
+    print("\n[3/3] Evaluating models...")
     print("-" * 40)
 
-    split_path = Path(args.split_path)
-    split_artifact = load_ratings_user_split(split_path)
-    user_train = split_artifact.user_train
-    user_test = split_artifact.user_test
-    eval_users = list(split_artifact.eval_users)
-
-    # Sample users
-    if len(eval_users) > args.sample_users:
-        random_state = int(split_artifact.metadata.get("random_state", eval_config.random_state))
-        rng = np.random.default_rng(random_state)
-        eval_users = list(rng.choice(eval_users, args.sample_users, replace=False))
-
-    print(f"  Split path: {split_path}")
-    print(f"  Train interactions: {split_artifact.metadata.get('train_interactions', 'N/A')}")
-    print(f"  Test interactions: {split_artifact.metadata.get('test_interactions', 'N/A')}")
-    print(f"  Evaluation users: {len(eval_users)}")
-    print(f"  K values: {args.k}")
-    print(f"  Split seed: {split_artifact.metadata.get('random_state', eval_config.random_state)}")
-
-    # =========================================================================
-    # Evaluate Models
-    # =========================================================================
-    print("\n[3/3] Evaluating Models...")
-    print("-" * 40)
-
-    all_results = {}
+    all_results: Dict[str, Dict] = {}
+    eval_anime_info = anime_info if not args.no_diversity else None
+    eval_corpus = corpus_genres if not args.no_diversity else None
 
     if content_model is not None:
-        start = time.time()
-        all_results['Content'] = evaluate_content_model(
-            content_model, user_train, user_test, eval_users, args.k, args.sample_users
+        t0 = time.time()
+        all_results["Content"] = evaluate_content_model(
+            content_model,
+            user_train,
+            user_test,
+            eval_users,
+            args.k,
+            args.sample_users,
+            anime_info=eval_anime_info,
+            corpus_genres=eval_corpus,
         )
-        print(f"  Content evaluation time: {time.time() - start:.1f}s")
+        print(f"  Content done: {time.time()-t0:.1f}s")
 
     if collaborative_model is not None:
-        start = time.time()
-        all_results['Collaborative'] = evaluate_collaborative_model(
-            collaborative_model, user_train, user_test, eval_users, args.k, args.sample_users
+        t0 = time.time()
+        all_results["Collaborative"] = evaluate_collaborative_model(
+            collaborative_model,
+            user_train,
+            user_test,
+            eval_users,
+            args.k,
+            args.sample_users,
+            anime_info=eval_anime_info,
+            corpus_genres=eval_corpus,
         )
-        print(f"  Collaborative evaluation time: {time.time() - start:.1f}s")
+        print(f"  Collaborative done: {time.time()-t0:.1f}s")
 
     if implicit_model is not None:
-        start = time.time()
-        all_results['Implicit'] = evaluate_implicit_model(
-            implicit_model, user_train, user_test, eval_users, args.k, args.sample_users
+        t0 = time.time()
+        all_results["Implicit"] = evaluate_implicit_model(
+            implicit_model,
+            user_train,
+            user_test,
+            eval_users,
+            args.k,
+            args.sample_users,
+            anime_info=eval_anime_info,
+            corpus_genres=eval_corpus,
         )
-        print(f"  Implicit evaluation time: {time.time() - start:.1f}s")
+        print(f"  Implicit done: {time.time()-t0:.1f}s")
 
     if popularity_model is not None:
-        start = time.time()
-        all_results['Popularity'] = evaluate_popularity_model(
-            popularity_model, user_train, user_test, eval_users, args.k, args.sample_users
+        t0 = time.time()
+        all_results["Popularity"] = evaluate_popularity_model(
+            popularity_model,
+            user_train,
+            user_test,
+            eval_users,
+            args.k,
+            args.sample_users,
+            anime_info=eval_anime_info,
+            corpus_genres=eval_corpus,
         )
-        print(f"  Popularity evaluation time: {time.time() - start:.1f}s")
+        print(f"  Popularity done: {time.time()-t0:.1f}s")
 
     if hybrid_engine is not None:
-        start = time.time()
-        all_results['Hybrid'] = evaluate_hybrid_model(
-            hybrid_engine, user_train, user_test, eval_users, args.k, args.sample_users
+        t0 = time.time()
+        all_results["Hybrid"] = evaluate_hybrid_model(
+            hybrid_engine,
+            user_train,
+            user_test,
+            eval_users,
+            args.k,
+            args.sample_users,
+            model_label="Hybrid",
+            anime_info=eval_anime_info,
+            corpus_genres=eval_corpus,
         )
-        print(f"  Hybrid evaluation time: {time.time() - start:.1f}s")
+        print(f"  Hybrid done: {time.time()-t0:.1f}s")
 
-    # =========================================================================
-    # Print Results
-    # =========================================================================
-    print("\n" + "=" * 60)
-    print("EVALUATION RESULTS")
-    print("=" * 60)
+    if learned_engine is not None:
+        t0 = time.time()
+        all_results["LearnedHybrid"] = evaluate_hybrid_model(
+            learned_engine,
+            user_train,
+            user_test,
+            eval_users,
+            args.k,
+            args.sample_users,
+            model_label="LearnedHybrid",
+            anime_info=eval_anime_info,
+            corpus_genres=eval_corpus,
+        )
+        print(f"  LearnedHybrid done: {time.time()-t0:.1f}s")
+
+    if not all_results:
+        print("\nKhông có model nào được evaluate. Kiểm tra lại path và --skip flags.")
+        return {}
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Print results
+    # ─────────────────────────────────────────────────────────────────────
+    print("\n\n" + "=" * 70)
+    print("  EVALUATION RESULTS — Detail")
+    print("=" * 70)
 
     for model_name, results in all_results.items():
         print_model_results(model_name, results)
 
+    # Comparison tables per K
     for k in args.k:
         print_comparison_table(all_results, k)
+        if not args.no_diversity and anime_info:
+            print_diversity_table(all_results, k)
 
-    # Find best models
-    print("\n" + "=" * 60)
-    print("BEST MODEL PER METRIC")
-    print("=" * 60)
-
+    # Best model summary
+    print("\n" + "=" * 70)
+    print("  BEST MODEL PER METRIC")
+    print("=" * 70)
     for k in args.k:
-        print(f"\nAt K={k}:")
-        for metric in ['precision', 'recall', 'f1', 'hit_rate', 'mrr', 'ndcg', 'map']:
-            best_model, best_value = find_best_model(all_results, k, metric)
+        print(f"\n  @ K={k}:")
+        for metric in ["precision", "recall", "ndcg", "hit_rate", "mrr", "map"]:
+            best_model, best_val = find_best_model(all_results, k, metric)
             if best_model:
-                print(f"  {metric:<12}: {best_model} ({best_value:.4f})")
+                print(f"    {metric:<12}  →  {best_model}  ({best_val:.4f})")
 
-    # =========================================================================
-    # Save Results
-    # =========================================================================
+    # LearnedHybrid improvement over Hybrid
+    if "Hybrid" in all_results and "LearnedHybrid" in all_results:
+        print("\n" + "=" * 70)
+        print("  LearnedHybrid vs Hybrid (hard-coded) — improvement")
+        print("=" * 70)
+        for k in args.k:
+            k_key = f"K={k}"
+            print(f"\n  @ K={k}:")
+            for metric in ["precision", "recall", "ndcg", "hit_rate", "mrr"]:
+                h_val = all_results["Hybrid"].get(k_key, {}).get(metric, 0.0)
+                l_val = all_results["LearnedHybrid"].get(k_key, {}).get(metric, 0.0)
+                if h_val > 0:
+                    diff = l_val - h_val
+                    pct = diff / h_val * 100
+                    sign = "+" if diff >= 0 else ""
+                    print(
+                        f"    {metric:<12}  {h_val:.4f} → {l_val:.4f}  "
+                        f"({sign}{diff:.4f}, {sign}{pct:.1f}%)"
+                    )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Save JSON
+    # ─────────────────────────────────────────────────────────────────────
     total_time = time.time() - total_start
 
     output_data = {
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'config': {
-            'sample_users': args.sample_users,
-            'k_values': args.k,
-            'split_path': str(split_path),
-            'split_metadata': split_artifact.metadata,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "config": {
+            "sample_users": args.sample_users,
+            "k_values": args.k,
+            "split_path": str(split_path),
+            "split_meta": split_artifact.metadata,
+            "diversity": not args.no_diversity,
         },
-        'fixes_applied': [
-            'Single persisted split created before training',
-            'Training uses only user_train interactions',
-            'Evaluation measures only user_test interactions',
-            'All evaluated models share the same split artifact',
-        ],
-        'results': all_results,
-        'total_time': f"{total_time:.2f}s"
+        "results": all_results,
+        "total_time": f"{total_time:.2f}s",
     }
 
     output_path = Path(args.output)
-    with open(output_path, 'w') as f:
-        json.dump(output_data, f, indent=2)
+    with open(output_path, "w") as f:
+        json.dump(output_data, f, indent=2, default=str)
 
-    print("\n" + "=" * 60)
-    print(f"Evaluation Complete! Total time: {total_time:.1f}s")
-    print(f"Results saved to: {output_path}")
-    print("=" * 60)
+    print(f"\n{'=' * 70}")
+    print(f"  Evaluation complete!  Total time: {total_time:.1f}s")
+    print(f"  Results saved → {output_path}")
+    print(f"{'=' * 70}\n")
 
     return all_results
 

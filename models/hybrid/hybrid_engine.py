@@ -1,11 +1,36 @@
 """
-Hybrid Recommendation Engine.
+Hybrid Recommendation Engine v2.
 
-Combines multiple recommendation techniques:
-- Content-Based Filtering
-- Collaborative Filtering (Item-Based, Matrix Factorization)
-- Implicit Feedback
-- Popularity-Based
+Thay đổi so với bản gốc:
+
+1. WEIGHTS CẢI TIẾN dựa trên kết quả evaluation thực tế:
+   Bản gốc: content=0.25, collaborative=0.30, implicit=0.35, popularity=0.10
+   Bản mới: content=0.20, collaborative=0.25, implicit=0.50, popularity=0.05
+   Lý do: Implicit ALS đạt Precision@10=0.265, nhưng chỉ được 35% weight
+           → Hybrid (0.173) tệ hơn Implicit đơn lẻ — cần tăng weight lên 50%
+
+2. CASCADE PIPELINE thay cho weighted sum đơn giản:
+   Stage 1 Retrieval: mỗi model lấy top-N candidates → Union
+   Stage 2 Scoring:   normalize + weighted combination
+   Stage 3 Diversity: Genre-aware MMR (xem bên dưới)
+   Stage 4 Result:    trả về kèm source_scores
+
+3. GENRE-AWARE MMR thay cho MMR dùng latent factor cosine:
+   Dùng Jaccard overlap của genre sets để đo similarity giữa items
+   → Đa dạng genre thực sự, không chỉ latent-factor diversity
+   lambda_=0 (no diversity) ... 0.3 (recommended) ... 1.0 (pure diversity)
+
+4. DIVERSITY METRICS (ILD, Coverage, Entropy):
+   evaluate_diversity(recommendations) → dict
+   Dùng để tune diversity_lambda:
+     ILD < 0.5 → tăng lambda
+     ILD > 0.8 → giảm lambda
+     Target: ILD ∈ [0.60, 0.75]
+
+5. ANIME-TO-ANIME: Union content + ALS item sim → aggregate → Genre MMR
+
+6. recommend_for_user() dùng content_model.recommend_for_user() mới
+   (giao diện thống nhất với FAISS)
 """
 
 import numpy as np
@@ -24,24 +49,173 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Genre diversity utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _parse_genres(genres_str: str) -> Set[str]:
+    """'Action, Comedy, Drama' → {'action', 'comedy', 'drama'}"""
+    if not genres_str:
+        return set()
+    return {g.strip().lower() for g in str(genres_str).split(",") if g.strip()}
+
+
+def _genre_jaccard(a: Set[str], b: Set[str]) -> float:
+    """Jaccard similarity của 2 genre sets. Range [0,1]."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def genre_aware_mmr(
+    candidates: List[Dict],
+    top_k: int,
+    lambda_: float = 0.3,
+    anime_info: Dict[int, Dict] = None,
+) -> List[Dict]:
+    """
+    Maximal Marginal Relevance với genre diversity.
+
+    Iteratively chọn items theo:
+        MMR(i) = (1 - lambda_) * relevance(i)
+                 - lambda_ * max_{j in selected} genre_jaccard(i, j)
+
+    lambda_=0   → pure relevance (giống sort thông thường)
+    lambda_=0.3 → balance (recommended cho anime rec)
+    lambda_=1.0 → pure diversity
+
+    Parameters
+    ----------
+    candidates  : list of dicts có 'mal_id' và 'hybrid_score'
+    top_k       : số items muốn chọn
+    lambda_     : diversity trade-off
+    anime_info  : {anime_id: {"genres": str, ...}}
+
+    Returns
+    -------
+    List[Dict] top_k items đã re-rank
+    """
+    if not candidates or top_k <= 0:
+        return candidates[:top_k]
+    if lambda_ == 0 or anime_info is None:
+        return candidates[:top_k]
+
+    # Parse genres một lần
+    genre_sets = [
+        _parse_genres(anime_info.get(c["mal_id"], {}).get("genres", ""))
+        for c in candidates
+    ]
+
+    # Normalize scores về [0, 1]
+    scores = np.array([c.get("hybrid_score", 0.0) for c in candidates], dtype=float)
+    s_min, s_max = scores.min(), scores.max()
+    norm_scores = (
+        (scores - s_min) / (s_max - s_min) if s_max > s_min else np.ones(len(scores))
+    )
+
+    selected_idx: List[int] = []
+    selected_genres: List[Set[str]] = []
+    remaining = list(range(len(candidates)))
+
+    for _ in range(min(top_k, len(candidates))):
+        best_i, best_score = None, -np.inf
+        for i in remaining:
+            relevance = (1 - lambda_) * norm_scores[i]
+            max_sim = max(
+                (_genre_jaccard(genre_sets[i], sg) for sg in selected_genres),
+                default=0.0,
+            )
+            mmr = relevance - lambda_ * max_sim
+            if mmr > best_score:
+                best_score, best_i = mmr, i
+        if best_i is None:
+            break
+        selected_idx.append(best_i)
+        selected_genres.append(genre_sets[best_i])
+        remaining.remove(best_i)
+
+    return [candidates[i] for i in selected_idx]
+
+
+def compute_diversity_metrics(
+    recommendations: List[Dict],
+    anime_info: Dict[int, Dict],
+) -> Dict[str, float]:
+    """
+    Tính diversity metrics cho một list gợi ý.
+
+    Returns
+    -------
+    {
+      "ILD"          : Intra-List Diversity = 1 - mean(pairwise genre Jaccard)
+                       Range [0,1], target [0.60, 0.75]
+      "coverage"     : % unique genres trong recs / total genres in corpus
+      "entropy"      : Shannon entropy của genre distribution trong recs
+      "n_unique_genres" : số genres unique trong recs
+    }
+    """
+    if not recommendations:
+        return {"ILD": 0.0, "coverage": 0.0, "entropy": 0.0, "n_unique_genres": 0}
+
+    genre_sets = []
+    genre_counts: Dict[str, int] = {}
+    for rec in recommendations:
+        gs = _parse_genres(anime_info.get(rec.get("mal_id", 0), {}).get("genres", ""))
+        genre_sets.append(gs)
+        for g in gs:
+            genre_counts[g] = genre_counts.get(g, 0) + 1
+
+    n = len(genre_sets)
+    if n > 1:
+        pairwise = [
+            _genre_jaccard(genre_sets[i], genre_sets[j])
+            for i in range(n)
+            for j in range(i + 1, n)
+        ]
+        ild = 1.0 - float(np.mean(pairwise))
+    else:
+        ild = 0.0
+
+    all_rec_genres = set().union(*genre_sets) if genre_sets else set()
+    all_corpus_genres: Set[str] = set()
+    for info in anime_info.values():
+        all_corpus_genres |= _parse_genres(info.get("genres", ""))
+    coverage = (
+        len(all_rec_genres) / len(all_corpus_genres) if all_corpus_genres else 0.0
+    )
+
+    total = sum(genre_counts.values())
+    if total > 0:
+        probs = np.array([c / total for c in genre_counts.values()])
+        entropy = float(-np.sum(probs * np.log(probs + 1e-10)))
+    else:
+        entropy = 0.0
+
+    return {
+        "ILD": round(ild, 4),
+        "coverage": round(coverage, 4),
+        "entropy": round(entropy, 4),
+        "n_unique_genres": len(all_rec_genres),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HybridEngine v2
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class HybridEngine:
     """
-    Hybrid Recommendation Engine combining multiple models.
+    Hybrid Recommendation Engine v2 — Cascade + Genre Diversity.
 
-    Final Score = w1 * ContentScore + w2 * CollaborativeScore +
-                  w3 * ImplicitScore + w4 * PopularityScore
+    Weights mặc định (dựa trên Precision@10 evaluation):
+        implicit:      0.50  (Precision@10 = 0.265 — tốt nhất, ~3x collab)
+        collaborative: 0.25  (Precision@10 = 0.093)
+        content:       0.20  (Precision@10 = 0.073)
+        popularity:    0.05  (chỉ dùng như diversity boost)
 
-    Strategies:
-    - New user: Content + Popularity (no collaborative data)
-    - Existing user: Full Hybrid
-    - Cold start item: Content + Popularity
-
-    Attributes:
-        content_model: Content-based recommender
-        collaborative_model: Item-based or Matrix Factorization model
-        implicit_model: ALS implicit model
-        popularity_model: Popularity-based model
-        weights: Dictionary of model weights
+    Bản gốc weights (implicit=0.35) khiến Hybrid (0.173) tệ hơn Implicit đơn lẻ (0.265).
     """
 
     def __init__(
@@ -51,168 +225,165 @@ class HybridEngine:
         collaborative_model=None,
         implicit_model=None,
         popularity_model=None,
+        diversity_lambda: float = 0.3,
     ):
-        """
-        Initialize HybridEngine.
-
-        Args:
-            weights: Dictionary with keys 'content', 'collaborative', 'implicit', 'popularity'
-            content_model: Content-based recommender instance
-            collaborative_model: Collaborative filtering model instance
-            implicit_model: Implicit feedback model instance
-            popularity_model: Popularity model instance
-        """
-        self.weights = weights or model_config.hybrid_weights.copy()
-
+        self.weights = weights or {
+            "content": 0.20,
+            "collaborative": 0.25,
+            "implicit": 0.50,
+            "popularity": 0.05,
+        }
         self.content_model = content_model
         self.collaborative_model = collaborative_model
         self.implicit_model = implicit_model
         self.popularity_model = popularity_model
+        self.diversity_lambda = diversity_lambda
 
-        # Anime info cache
         self._anime_info: Dict[int, Dict] = {}
-
-        # User history cache
         self._user_ratings: Dict[int, Dict[int, float]] = {}
         self._user_watched: Dict[int, Set[int]] = {}
 
-    def set_weights(self, weights: Dict[str, float]) -> None:
-        """
-        Update model weights.
+    # ─────────────────────────────────────────────────────────────
+    # Setup
+    # ─────────────────────────────────────────────────────────────
 
-        Args:
-            weights: New weights dictionary
-        """
+    def set_weights(self, weights: Dict[str, float]) -> None:
         self.weights.update(weights)
-        # Normalize weights
         total = sum(self.weights.values())
         if total > 0:
-            for key in self.weights:
-                self.weights[key] /= total
-
-        logger.info(f"Updated weights: {self.weights}")
+            for k in self.weights:
+                self.weights[k] /= total
+        logger.info(f"Weights updated: {self.weights}")
 
     def set_anime_info(self, anime_df: pd.DataFrame) -> None:
-        """
-        Set anime information for enriching recommendations.
-
-        Args:
-            anime_df: DataFrame with anime metadata
-        """
         for _, row in anime_df.iterrows():
-            self._anime_info[row["MAL_ID"]] = {
-                "mal_id": int(row["MAL_ID"]),
+            aid = int(row["MAL_ID"])
+            try:
+                score = (
+                    float(row.get("Score", 0)) if pd.notna(row.get("Score")) else 0.0
+                )
+            except (ValueError, TypeError):
+                score = 0.0
+            self._anime_info[aid] = {
+                "mal_id": aid,
                 "name": row["Name"],
                 "english_name": row.get("English name", row["Name"]),
                 "genres": row.get("Genres", ""),
-                "score": (
-                    float(row.get("Score", 0)) if pd.notna(row.get("Score")) else 0
-                ),
+                "score": score,
                 "type": row.get("Type", "Unknown"),
                 "synopsis": row.get("synopsis", ""),
             }
 
     def set_user_history(
-        self, user_id: int, ratings: Dict[int, float] = None, watched: Set[int] = None
+        self,
+        user_id: int,
+        ratings: Dict[int, float] = None,
+        watched: Set[int] = None,
     ) -> None:
-        """
-        Set user history for personalization.
-
-        Args:
-            user_id: User ID
-            ratings: Dictionary of anime_id -> rating
-            watched: Set of watched anime IDs
-        """
         if ratings:
             self._user_ratings[user_id] = ratings
         if watched:
             self._user_watched[user_id] = watched
 
+    # ─────────────────────────────────────────────────────────────
+    # ANIME-TO-ANIME
+    # ─────────────────────────────────────────────────────────────
+
     def recommend_similar_anime(
-        self, anime_identifier: Union[int, str], top_k: int = 10, method: str = "hybrid"
+        self,
+        anime_identifier: Union[int, str],
+        top_k: int = 10,
+        method: str = "hybrid",
+        use_diversity: bool = True,
     ) -> List[Dict]:
         """
-        Get similar anime recommendations (anime-to-anime).
+        Gợi ý anime tương tự — cascade pipeline.
 
-        Args:
-            anime_identifier: Anime ID or name
-            top_k: Number of recommendations
-            method: "content", "collaborative", "hybrid"
-
-        Returns:
-            List of recommendation dictionaries
+        Stage 1: Content similarity (top-50) + ALS item sim (top-30)
+                 + Collaborative item sim (top-30)
+        Stage 2: Union candidates, aggregate weighted scores
+        Stage 3: Genre-aware MMR nếu use_diversity=True
         """
-        scores = {}
+        scores: Dict[int, Dict[str, float]] = {}
 
-        # Content-based similarity
-        if self.content_model and method in ["content", "hybrid"]:
+        # Content
+        if self.content_model and method in ("content", "hybrid"):
             try:
-                content_recs = self.content_model.get_similar_anime(
-                    anime_identifier, top_k=top_k * 2
+                recs = self.content_model.get_similar_anime(
+                    anime_identifier, top_k=top_k * 4
                 )
-                weight = self.weights.get("content", 0.3) if method == "hybrid" else 1.0
-                for rec in content_recs:
-                    aid = rec["mal_id"]
-                    scores[aid] = scores.get(aid, 0) + weight * rec["similarity"]
+                w = self.weights["content"] if method == "hybrid" else 1.0
+                for rec in recs:
+                    scores.setdefault(rec["mal_id"], {})["content"] = (
+                        w * rec["similarity"]
+                    )
             except Exception as e:
-                logger.warning(f"Content model error: {e}")
+                logger.warning(f"Content similarity error: {e}")
 
-        # Collaborative similarity
-        if self.collaborative_model and method in ["collaborative", "hybrid"]:
+        # Collaborative (BPR/SVD item factors)
+        if self.collaborative_model and method in ("collaborative", "hybrid"):
             try:
-                # Get anime ID if string was provided
-                anime_id = anime_identifier
-                if isinstance(anime_identifier, str) and self.content_model:
-                    idx = self.content_model._get_anime_idx(anime_identifier)
-                    if idx is not None:
-                        anime_id = self.content_model._idx_to_id.get(idx)
-
-                if isinstance(anime_id, int):
-                    collab_recs = self.collaborative_model.get_similar_items(
-                        anime_id, top_k=top_k * 2
+                anime_id = self._resolve_anime_id(anime_identifier)
+                if anime_id:
+                    recs = self.collaborative_model.get_similar_items(
+                        anime_id, top_k=top_k * 3
                     )
-                    weight = (
-                        self.weights.get("collaborative", 0.4)
-                        if method == "hybrid"
-                        else 1.0
-                    )
-                    for rec in collab_recs:
-                        aid = rec["mal_id"]
-                        scores[aid] = scores.get(aid, 0) + weight * rec["similarity"]
+                    w = self.weights["collaborative"] if method == "hybrid" else 1.0
+                    for rec in recs:
+                        scores.setdefault(rec["mal_id"], {})["collaborative"] = (
+                            w * rec["similarity"]
+                        )
             except Exception as e:
-                logger.warning(f"Collaborative model error: {e}")
+                logger.warning(f"Collaborative similarity error: {e}")
 
-        # Implicit similarity (if available)
+        # Implicit (ALS item factors — dùng implicit library's FAISS internally)
         if self.implicit_model and method == "hybrid":
             try:
-                anime_id = anime_identifier
-                if isinstance(anime_identifier, str) and self.content_model:
-                    idx = self.content_model._get_anime_idx(anime_identifier)
-                    if idx is not None:
-                        anime_id = self.content_model._idx_to_id.get(idx)
-
-                if isinstance(anime_id, int):
-                    implicit_recs = self.implicit_model.get_similar_items(
-                        anime_id, top_k=top_k * 2
+                anime_id = self._resolve_anime_id(anime_identifier)
+                if anime_id:
+                    recs = self.implicit_model.get_similar_items(
+                        anime_id, top_k=top_k * 3
                     )
-                    weight = self.weights.get("implicit", 0.2)
-                    for rec in implicit_recs:
-                        aid = rec["mal_id"]
-                        scores[aid] = scores.get(aid, 0) + weight * rec["similarity"]
+                    w = self.weights["implicit"]
+                    for rec in recs:
+                        scores.setdefault(rec["mal_id"], {})["implicit"] = w * rec.get(
+                            "similarity", 0
+                        )
             except Exception as e:
-                logger.warning(f"Implicit model error: {e}")
+                logger.warning(f"Implicit similarity error: {e}")
 
-        # Sort by combined score
-        sorted_recs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        # Aggregate + sort
+        aggregated = sorted(
+            [
+                {
+                    "mal_id": aid,
+                    "hybrid_score": sum(s.values()),
+                    "sources": list(s.keys()),
+                }
+                for aid, s in scores.items()
+            ],
+            key=lambda x: -x["hybrid_score"],
+        )
 
-        # Build results with anime info
-        results = []
-        for aid, score in sorted_recs[:top_k]:
-            rec = self._get_anime_info(aid)
-            rec["hybrid_score"] = score
-            results.append(rec)
+        # Enrich với anime info
+        pool_size = min(top_k * 4, len(aggregated))
+        enriched = []
+        for item in aggregated[:pool_size]:
+            rec = self._get_anime_info(item["mal_id"])
+            rec["hybrid_score"] = item["hybrid_score"]
+            rec["sources"] = item["sources"]
+            enriched.append(rec)
 
-        return results
+        # Genre-aware MMR
+        if use_diversity and self.diversity_lambda > 0 and len(enriched) > top_k:
+            return genre_aware_mmr(
+                enriched, top_k, self.diversity_lambda, self._anime_info
+            )
+        return enriched[:top_k]
+
+    # ─────────────────────────────────────────────────────────────
+    # USER RECOMMENDATION
+    # ─────────────────────────────────────────────────────────────
 
     def recommend_for_user(
         self,
@@ -220,273 +391,347 @@ class HybridEngine:
         top_k: int = 10,
         exclude_watched: bool = True,
         strategy: str = "auto",
+        use_diversity: bool = True,
+        diversity_lambda: float = None,
     ) -> List[Dict]:
         """
-        Get personalized recommendations for a user.
+        Gợi ý cho user — cascade pipeline.
 
-        Args:
-            user_id: User ID
-            top_k: Number of recommendations
-            exclude_watched: Whether to exclude already watched anime
-            strategy: "auto", "new_user", "existing_user"
-
-        Returns:
-            List of recommendation dictionaries
+        Parameters
+        ----------
+        user_id         : user ID
+        top_k           : số kết quả cuối
+        exclude_watched : loại bỏ anime đã xem/rated
+        strategy        : "auto", "new_user", "existing_user"
+        use_diversity   : dùng genre-aware MMR
+        diversity_lambda: override self.diversity_lambda (dùng để A/B test)
         """
-        # Determine user type
-        is_new_user = self._is_new_user(user_id)
-
+        is_new = self._is_new_user(user_id)
         if strategy == "auto":
-            strategy = "new_user" if is_new_user else "existing_user"
+            strategy = "new_user" if is_new else "existing_user"
 
         if strategy == "new_user":
-            return self._recommend_for_new_user(user_id, top_k)
-        else:
-            return self._recommend_for_existing_user(user_id, top_k, exclude_watched)
-
-    def _is_new_user(self, user_id: int) -> bool:
-        """Check if user is new (no collaborative data)."""
-        # Check if user exists in collaborative models
-        if self.collaborative_model:
-            if hasattr(self.collaborative_model, "user_to_idx"):
-                if user_id in self.collaborative_model.user_to_idx:
-                    return False
-
-        if self.implicit_model:
-            if hasattr(self.implicit_model, "user_to_idx"):
-                if user_id in self.implicit_model.user_to_idx:
-                    return False
-
-        return True
-
-    def _recommend_for_new_user(self, user_id: int, top_k: int) -> List[Dict]:
-        """Recommendations for new users using content + popularity."""
-        scores = {}
-
-        # Get user preferences if available
-        user_ratings = self._user_ratings.get(user_id, {})
-        preferred_genres = self._extract_preferred_genres(user_ratings)
-
-        # Popularity recommendations
-        if self.popularity_model:
-            pop_recs = self.popularity_model.get_recommendations_for_new_user(
-                top_k=top_k * 2, preferred_genres=preferred_genres
+            return self._recommend_new_user(
+                user_id, top_k, use_diversity, diversity_lambda
             )
-            for rec in pop_recs:
-                aid = rec["mal_id"]
-                scores[aid] = (
-                    scores.get(aid, 0)
-                    + 0.6 * rec.get("popularity_score", rec.get("score", 0)) / 100
-                )
+        return self._recommend_existing_user(
+            user_id, top_k, exclude_watched, use_diversity, diversity_lambda
+        )
 
-        # Content-based if user has some ratings
-        if self.content_model and user_ratings:
-            # Get similar to highly rated anime
-            top_rated = sorted(user_ratings.items(), key=lambda x: x[1], reverse=True)[
-                :5
-            ]
-
-            for anime_id, rating in top_rated:
-                try:
-                    content_recs = self.content_model.get_similar_anime(
-                        anime_id, top_k=10
-                    )
-                    for rec in content_recs:
-                        aid = rec["mal_id"]
-                        if aid not in user_ratings:  # Exclude already rated
-                            weight = (rating / 10) * 0.4  # Weight by user rating
-                            scores[aid] = (
-                                scores.get(aid, 0) + weight * rec["similarity"]
-                            )
-                except Exception:
-                    pass
-
-        # Sort and build results
-        sorted_recs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-        results = []
-        watched = self._user_watched.get(user_id, set())
-
-        for aid, score in sorted_recs:
-            if aid in watched or aid in user_ratings:
-                continue
-            rec = self._get_anime_info(aid)
-            rec["hybrid_score"] = score
-            rec["strategy"] = "new_user"
-            results.append(rec)
-            if len(results) >= top_k:
-                break
-
-        return results
-
-    def _recommend_for_existing_user(
-        self, user_id: int, top_k: int, exclude_watched: bool
+    def _recommend_existing_user(
+        self,
+        user_id: int,
+        top_k: int,
+        exclude_watched: bool,
+        use_diversity: bool,
+        diversity_lambda: float = None,
     ) -> List[Dict]:
-        """Full hybrid recommendations for existing users."""
-        scores = {}
+        """Full cascade pipeline cho existing users."""
+        lambda_ = (
+            diversity_lambda if diversity_lambda is not None else self.diversity_lambda
+        )
 
-        # Get user's watched/rated items
-        watched = self._user_watched.get(user_id, set())
-        rated = set(self._user_ratings.get(user_id, {}).keys())
-        exclude_set = watched.union(rated) if exclude_watched else set()
+        exclude_set: Set[int] = set()
+        if exclude_watched:
+            exclude_set = self._user_watched.get(user_id, set()) | set(
+                self._user_ratings.get(user_id, {}).keys()
+            )
 
-        # Collaborative filtering recommendations
+        # Retrieval pool: lấy nhiều để diversity có đủ candidates
+        retrieval_k = max(top_k * 8, 100)
+        candidates: Dict[int, Dict[str, float]] = {}
+
+        # ── ALS Implicit (model tốt nhất, lấy nhiều nhất) ───────────
+        if self.implicit_model:
+            try:
+                recs = self.implicit_model.recommend_for_user(
+                    user_id,
+                    top_k=retrieval_k,
+                    exclude_known=exclude_watched,
+                    known_items=exclude_set,
+                    use_diversity=False,  # diversity xử lý ở Stage 3
+                )
+                w = self.weights["implicit"]
+                for rec in recs:
+                    aid = rec["mal_id"]
+                    # ALS scores: clip về [0, inf) rồi normalize theo max
+                    score = float(np.clip(rec.get("score", 0), 0, None))
+                    candidates.setdefault(aid, {})["implicit"] = w * score
+            except Exception as e:
+                logger.warning(f"Implicit retrieval: {e}")
+
+        # ── Collaborative (BPR/SVD) ──────────────────────────────────
         if self.collaborative_model:
             try:
-                collab_recs = self.collaborative_model.recommend_for_user(
+                recs = self.collaborative_model.recommend_for_user(
                     user_id,
-                    top_k=top_k * 3,
+                    top_k=retrieval_k // 2,
                     exclude_rated=exclude_watched,
                     rated_items=exclude_set,
                 )
-                weight = self.weights.get("collaborative", 0.4)
-                for rec in collab_recs:
+                w = self.weights["collaborative"]
+                for rec in recs:
                     aid = rec["mal_id"]
-                    if "score" in rec:
-                        raw_score = np.clip(rec["score"], -20, 20)
-                        norm_score = 1.0 / (1.0 + np.exp(-raw_score))
-                    else:
-                        norm_score = (
-                            rec.get("predicted_rating", rec.get("similarity", 5)) / 10
-                        )
-                    scores[aid] = scores.get(aid, 0) + weight * norm_score
+                    raw = rec.get("score", rec.get("predicted_rating", 5.0))
+                    # BPR scores unbounded → sigmoid normalize
+                    norm = float(1.0 / (1.0 + np.exp(-np.clip(float(raw), -20, 20))))
+                    candidates.setdefault(aid, {})["collaborative"] = w * norm
             except Exception as e:
-                logger.warning(f"Collaborative recommendation error: {e}")
+                logger.warning(f"Collaborative retrieval: {e}")
 
-        # Implicit feedback recommendations
-        if self.implicit_model:
-            try:
-                implicit_recs = self.implicit_model.recommend_for_user(
-                    user_id,
-                    top_k=top_k * 3,
-                    exclude_known=exclude_watched,
-                    known_items=exclude_set,
-                )
-                weight = self.weights.get("implicit", 0.2)
-                for rec in implicit_recs:
-                    aid = rec["mal_id"]
-                    scores[aid] = scores.get(aid, 0) + weight * rec.get("score", 0)
-            except Exception as e:
-                logger.warning(f"Implicit recommendation error: {e}")
-
-        # Content-based (similar to user's top rated)
+        # ── Content-Based ────────────────────────────────────────────
         if self.content_model:
-            user_ratings = self._user_ratings.get(user_id, {})
-            if (
-                user_ratings
-                and hasattr(self.content_model, "build_user_vector")
-                and hasattr(self.content_model, "embeddings")
-                and self.content_model.embeddings is not None
-            ):
-                try:
-                    all_ratings = user_ratings.copy()
-                    user_vec = self.content_model.build_user_vector(
+            try:
+                user_ratings = self._user_ratings.get(user_id, {})
+                if user_ratings:
+                    # Dùng recommend_for_user mới (tích hợp FAISS)
+                    recs = self.content_model.recommend_for_user(
+                        user_id=user_id,
                         user_ratings=user_ratings,
-                        all_ratings=all_ratings,
-                        positive_percentile=50.0,
-                        negative_percentile=25.0,
-                        negative_weight=0.4,
+                        top_k=retrieval_k // 4,
+                        exclude_ids=exclude_set,
                     )
+                    w = self.weights["content"]
+                    for rec in recs:
+                        candidates.setdefault(rec["mal_id"], {})["content"] = (
+                            w * rec.get("similarity", 0)
+                        )
+            except Exception as e:
+                logger.warning(f"Content retrieval: {e}")
 
-                    if user_vec is not None:
-                        sims = np.asarray(
-                            self.content_model.embeddings @ user_vec
-                        ).reshape(-1)
-
-                        if sims.size > 0:
-                            candidate_k = min(
-                                len(sims),
-                                max(top_k * 8, top_k + len(exclude_set)),
-                            )
-                            top_indices = np.argpartition(-sims, candidate_k - 1)[
-                                :candidate_k
-                            ]
-                            top_indices = top_indices[np.argsort(-sims[top_indices])]
-
-                            weight = self.weights.get("content", 0.3)
-                            for idx in top_indices:
-                                sim = float(sims[idx])
-                                if not np.isfinite(sim):
-                                    continue
-
-                                aid = self.content_model._idx_to_id.get(int(idx))
-                                if aid is None or aid in exclude_set:
-                                    continue
-
-                                # Map cosine similarity [-1, 1] to [0, 1] for stable fusion.
-                                norm_sim = float(np.clip((sim + 1.0) / 2.0, 0.0, 1.0))
-                                scores[aid] = scores.get(aid, 0) + weight * norm_sim
-                except Exception as e:
-                    logger.warning(f"Content recommendation error: {e}")
-
-        # Popularity boost for diversity
+        # ── Popularity (diversity boost) ─────────────────────────────
         if self.popularity_model:
-            pop_recs = self.popularity_model.get_top_rated(top_k=50)
-            weight = self.weights.get("popularity", 0.1)
-            for idx, rec in enumerate(pop_recs):
-                aid = rec["mal_id"]
-                if aid not in exclude_set:
-                    # Decreasing weight by rank
-                    rank_weight = (50 - idx) / 50
-                    scores[aid] = scores.get(aid, 0) + weight * rank_weight
+            try:
+                pop_recs = self.popularity_model.get_top_rated(top_k=100)
+                w = self.weights["popularity"]
+                n_pop = len(pop_recs)
+                for rank, rec in enumerate(pop_recs):
+                    aid = rec["mal_id"]
+                    if aid not in exclude_set:
+                        candidates.setdefault(aid, {})["popularity"] = (
+                            w * (n_pop - rank) / n_pop
+                        )
+            except Exception as e:
+                logger.warning(f"Popularity retrieval: {e}")
 
-        # Sort and build results
-        sorted_recs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        # ── Aggregate scores ─────────────────────────────────────────
+        aggregated = sorted(
+            [
+                {"mal_id": aid, "hybrid_score": sum(s.values()), "source_scores": s}
+                for aid, s in candidates.items()
+                if aid not in exclude_set
+            ],
+            key=lambda x: -x["hybrid_score"],
+        )
 
-        results = []
-        for aid, score in sorted_recs:
-            if aid in exclude_set:
-                continue
+        # ── Enrich với anime info ────────────────────────────────────
+        pool_size = min(top_k * 5, len(aggregated))
+        enriched = []
+        for item in aggregated[:pool_size]:
+            rec = self._get_anime_info(item["mal_id"])
+            rec["hybrid_score"] = item["hybrid_score"]
+            rec["source_scores"] = item["source_scores"]
+            rec["strategy"] = "existing_user"
+            enriched.append(rec)
+
+        # ── Genre-aware MMR ──────────────────────────────────────────
+        if use_diversity and lambda_ > 0 and len(enriched) > top_k:
+            return genre_aware_mmr(enriched, top_k, lambda_, self._anime_info)
+        return enriched[:top_k]
+
+    def _recommend_new_user(
+        self,
+        user_id: int,
+        top_k: int,
+        use_diversity: bool,
+        diversity_lambda: float = None,
+    ) -> List[Dict]:
+        """Cold-start: Popularity + Content (nếu user có ít nhất vài ratings)."""
+        lambda_ = (
+            diversity_lambda if diversity_lambda is not None else self.diversity_lambda
+        )
+        user_ratings = self._user_ratings.get(user_id, {})
+        watched = self._user_watched.get(user_id, set())
+        exclude_set = watched | set(user_ratings.keys())
+        scores: Dict[int, float] = {}
+
+        if self.popularity_model:
+            try:
+                pop_recs = self.popularity_model.get_recommendations_for_new_user(
+                    top_k=top_k * 3,
+                    preferred_genres=self._extract_preferred_genres(user_ratings),
+                )
+                for rec in pop_recs:
+                    aid = rec["mal_id"]
+                    if aid not in exclude_set:
+                        scores[aid] = (
+                            0.6 * rec.get("popularity_score", rec.get("score", 0)) / 100
+                        )
+            except Exception as e:
+                logger.warning(f"Popularity new_user: {e}")
+
+        if self.content_model and len(user_ratings) >= 3:
+            try:
+                recs = self.content_model.recommend_for_user(
+                    user_id=user_id,
+                    user_ratings=user_ratings,
+                    top_k=top_k * 2,
+                    exclude_ids=exclude_set,
+                )
+                for rec in recs:
+                    aid = rec["mal_id"]
+                    scores[aid] = scores.get(aid, 0) + 0.4 * rec.get("similarity", 0)
+            except Exception as e:
+                logger.warning(f"Content new_user: {e}")
+
+        enriched = []
+        for aid, score in sorted(scores.items(), key=lambda x: -x[1])[: top_k * 3]:
             rec = self._get_anime_info(aid)
             rec["hybrid_score"] = score
-            rec["strategy"] = "existing_user"
-            results.append(rec)
-            if len(results) >= top_k:
-                break
+            rec["strategy"] = "new_user"
+            enriched.append(rec)
 
-        return results
+        if use_diversity and lambda_ > 0 and len(enriched) > top_k:
+            return genre_aware_mmr(enriched, top_k, lambda_, self._anime_info)
+        return enriched[:top_k]
+
+    # ─────────────────────────────────────────────────────────────
+    # DIVERSITY EVALUATION
+    # ─────────────────────────────────────────────────────────────
+
+    def evaluate_diversity(self, recommendations: List[Dict]) -> Dict[str, float]:
+        """
+        Tính diversity metrics cho kết quả gợi ý.
+
+        Dùng để tune diversity_lambda:
+            ILD < 0.5 → tăng lambda
+            ILD > 0.8 → giảm lambda (có thể ảnh hưởng relevance)
+            Target: ILD ∈ [0.60, 0.75]
+
+        Returns
+        -------
+        {"ILD": float, "coverage": float, "entropy": float, "n_unique_genres": int}
+        """
+        return compute_diversity_metrics(recommendations, self._anime_info)
+
+    # ─────────────────────────────────────────────────────────────
+    # EXPLANATION
+    # ─────────────────────────────────────────────────────────────
+
+    def get_explanation(self, user_id: int, anime_id: int) -> Dict:
+        """Giải thích tại sao anime được gợi ý cho user."""
+        explanation = {
+            "anime_id": anime_id,
+            "anime_info": self._get_anime_info(anime_id),
+            "reasons": [],
+        }
+        user_ratings = self._user_ratings.get(user_id, {})
+
+        # Content reason
+        if self.content_model:
+            for rated_id, rating in sorted(user_ratings.items(), key=lambda x: -x[1])[
+                :3
+            ]:
+                try:
+                    for s in self.content_model.get_similar_anime(rated_id, top_k=20):
+                        if s["mal_id"] == anime_id:
+                            rated_name = self._get_anime_info(rated_id)["name"]
+                            explanation["reasons"].append(
+                                {
+                                    "type": "content_similarity",
+                                    "message": f"Similar to '{rated_name}' (you rated {rating:.0f}/10)",
+                                    "similarity": s["similarity"],
+                                }
+                            )
+                            break
+                except Exception:
+                    pass
+
+        # Genre match
+        user_genres = self._extract_preferred_genres(user_ratings)
+        anime_genres_raw = self._get_anime_info(anime_id).get("genres", "").lower()
+        matching = [g for g in user_genres if g in anime_genres_raw]
+        if matching:
+            explanation["reasons"].append(
+                {
+                    "type": "genre_match",
+                    "message": f"Matches your favorite genres: {', '.join(matching)}",
+                }
+            )
+
+        # Popularity
+        if self.popularity_model:
+            try:
+                for rank, p in enumerate(self.popularity_model.get_top_rated(top_k=50)):
+                    if p["mal_id"] == anime_id:
+                        explanation["reasons"].append(
+                            {
+                                "type": "popularity",
+                                "message": f"#{rank + 1} top rated overall",
+                            }
+                        )
+                        break
+            except Exception:
+                pass
+
+        return explanation
+
+    # ─────────────────────────────────────────────────────────────
+    # UTILITIES
+    # ─────────────────────────────────────────────────────────────
+
+    def _resolve_anime_id(self, identifier: Union[int, str]) -> Optional[int]:
+        if isinstance(identifier, int):
+            return identifier
+        if self.content_model:
+            idx = self.content_model._get_anime_idx(identifier)
+            if idx is not None:
+                return self.content_model._idx_to_id.get(idx)
+        return None
+
+    def _is_new_user(self, user_id: int) -> bool:
+        if self.collaborative_model and hasattr(
+            self.collaborative_model, "user_to_idx"
+        ):
+            if user_id in self.collaborative_model.user_to_idx:
+                return False
+        if self.implicit_model and hasattr(self.implicit_model, "user_to_idx"):
+            if user_id in self.implicit_model.user_to_idx:
+                return False
+        return True
 
     def _extract_preferred_genres(self, user_ratings: Dict[int, float]) -> List[str]:
-        """Extract user's preferred genres from their ratings."""
         if not user_ratings:
             return []
-
-        genre_scores = {}
-
-        for anime_id, rating in user_ratings.items():
-            if anime_id in self._anime_info:
-                genres = self._anime_info[anime_id].get("genres", "")
-                for genre in str(genres).split(","):
-                    genre = genre.strip()
-                    if genre:
-                        genre_scores[genre] = genre_scores.get(genre, 0) + rating
-
-        # Return top genres
-        sorted_genres = sorted(genre_scores.items(), key=lambda x: x[1], reverse=True)
-        return [g for g, _ in sorted_genres[:5]]
+        genre_scores: Dict[str, float] = {}
+        for aid, rating in user_ratings.items():
+            for g in _parse_genres(self._anime_info.get(aid, {}).get("genres", "")):
+                genre_scores[g] = genre_scores.get(g, 0) + rating
+        return [g for g, _ in sorted(genre_scores.items(), key=lambda x: -x[1])[:5]]
 
     def _get_anime_info(self, anime_id: int) -> Dict:
-        """Get anime information by ID."""
         if anime_id in self._anime_info:
             return self._anime_info[anime_id].copy()
-
-        # Try to get from content model
+        # Fallback: try content model
         if self.content_model and hasattr(self.content_model, "anime_df"):
             df = self.content_model.anime_df
             row = df[df["MAL_ID"] == anime_id]
             if not row.empty:
-                row = row.iloc[0]
+                r = row.iloc[0]
+                try:
+                    score = (
+                        float(r.get("Score", 0)) if pd.notna(r.get("Score")) else 0.0
+                    )
+                except (ValueError, TypeError):
+                    score = 0.0
                 return {
                     "mal_id": int(anime_id),
-                    "name": row.get("Name", "Unknown"),
-                    "english_name": row.get("English name", row.get("Name", "Unknown")),
-                    "genres": row.get("Genres", ""),
-                    "score": (
-                        float(row.get("Score", 0)) if pd.notna(row.get("Score")) else 0
-                    ),
-                    "type": row.get("Type", "Unknown"),
+                    "name": r.get("Name", "Unknown"),
+                    "english_name": r.get("English name", r.get("Name", "Unknown")),
+                    "genres": r.get("Genres", ""),
+                    "score": score,
+                    "type": r.get("Type", "Unknown"),
                 }
-
         return {
             "mal_id": anime_id,
             "name": f"Anime {anime_id}",
@@ -496,83 +741,14 @@ class HybridEngine:
             "type": "Unknown",
         }
 
-    def get_explanation(self, user_id: int, anime_id: int) -> Dict:
-        """
-        Get explanation for why an anime was recommended.
-
-        Args:
-            user_id: User ID
-            anime_id: Anime ID
-
-        Returns:
-            Dictionary with explanation details
-        """
-        explanation = {
-            "anime_id": anime_id,
-            "anime_info": self._get_anime_info(anime_id),
-            "reasons": [],
-        }
-
-        # Check content similarity
-        if self.content_model:
-            user_ratings = self._user_ratings.get(user_id, {})
-            for rated_id, rating in sorted(
-                user_ratings.items(), key=lambda x: x[1], reverse=True
-            )[:3]:
-                try:
-                    similar = self.content_model.get_similar_anime(rated_id, top_k=20)
-                    for s in similar:
-                        if s["mal_id"] == anime_id:
-                            rated_info = self._get_anime_info(rated_id)
-                            explanation["reasons"].append(
-                                {
-                                    "type": "content_similarity",
-                                    "message": f"Similar to '{rated_info['name']}' which you rated {rating}",
-                                    "similarity": s["similarity"],
-                                }
-                            )
-                            break
-                except Exception:
-                    pass
-
-        # Check popularity
-        if self.popularity_model:
-            for pop_type in ["top_rated", "trending"]:
-                pop_list = self.popularity_model.get_popular(
-                    top_k=50, popularity_type=pop_type
-                )
-                for idx, p in enumerate(pop_list):
-                    if p["mal_id"] == anime_id:
-                        explanation["reasons"].append(
-                            {
-                                "type": "popularity",
-                                "message": f"#{idx + 1} in {pop_type.replace('_', ' ')}",
-                            }
-                        )
-                        break
-
-        # Genre match
-        user_genres = self._extract_preferred_genres(
-            self._user_ratings.get(user_id, {})
-        )
-        anime_genres = self._get_anime_info(anime_id).get("genres", "")
-        matching_genres = [g for g in user_genres if g.lower() in anime_genres.lower()]
-        if matching_genres:
-            explanation["reasons"].append(
-                {
-                    "type": "genre_match",
-                    "message": f"Matches your preferred genres: {', '.join(matching_genres)}",
-                }
-            )
-
-        return explanation
+    # ─────────────────────────────────────────────────────────────
+    # SAVE / LOAD
+    # ─────────────────────────────────────────────────────────────
 
     def save(self, directory: Union[str, Path]) -> None:
-        """Save hybrid engine and all models."""
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
 
-        # Save individual models
         if self.content_model:
             self.content_model.save(directory / "content_model.pkl")
         if self.collaborative_model:
@@ -582,30 +758,29 @@ class HybridEngine:
         if self.popularity_model:
             self.popularity_model.save(directory / "popularity_model.pkl")
 
-        # Save engine state
-        state = {"weights": self.weights, "anime_info": self._anime_info}
+        state = {
+            "weights": self.weights,
+            "diversity_lambda": self.diversity_lambda,
+            "anime_info": self._anime_info,
+        }
         with open(directory / "hybrid_engine.pkl", "wb") as f:
             pickle.dump(state, f)
 
-        logger.info(f"HybridEngine saved to {directory}")
+        logger.info(f"HybridEngine v2 saved to {directory}")
 
     def load(self, directory: Union[str, Path]) -> "HybridEngine":
-        """Load hybrid engine and all models."""
         directory = Path(directory)
 
-        # Import model classes
         from models.content import ContentBasedRecommender
         from models.collaborative import ItemBasedCF, MatrixFactorization
         from models.implicit import ALSImplicit
         from models.popularity import PopularityModel
 
-        # Load individual models
         if (directory / "content_model.pkl").exists():
             self.content_model = ContentBasedRecommender()
             self.content_model.load(directory / "content_model.pkl")
 
         if (directory / "collaborative_model.pkl").exists():
-            # Try MatrixFactorization first, then ItemBasedCF
             try:
                 self.collaborative_model = MatrixFactorization()
                 self.collaborative_model.load(directory / "collaborative_model.pkl")
@@ -621,18 +796,12 @@ class HybridEngine:
             self.popularity_model = PopularityModel()
             self.popularity_model.load(directory / "popularity_model.pkl")
 
-        # Load engine state
         if (directory / "hybrid_engine.pkl").exists():
             with open(directory / "hybrid_engine.pkl", "rb") as f:
                 state = pickle.load(f)
-            self.weights = state["weights"]
-            self._anime_info = state["anime_info"]
+            self.weights = state.get("weights", self.weights)
+            self.diversity_lambda = state.get("diversity_lambda", self.diversity_lambda)
+            self._anime_info = state.get("anime_info", {})
 
-        logger.info(f"HybridEngine loaded from {directory}")
+        logger.info(f"HybridEngine v2 loaded from {directory}")
         return self
-
-
-if __name__ == "__main__":
-    # Test Hybrid Engine
-    print("HybridEngine module loaded successfully")
-    print("Use train.py to train all models and create a HybridEngine instance")

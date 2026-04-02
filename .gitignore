@@ -22,3 +22,4 @@ data
 .python311*
 *.csv
 saved_models/
+.history
