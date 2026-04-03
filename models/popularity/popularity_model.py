@@ -1,6 +1,8 @@
 """
 Popularity-Based Recommendation Model.
 """
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 import logging
@@ -13,6 +15,16 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_RATING_DTYPES = {
+    "anime_id": "int32",
+    "rating": "int8",
+}
+
+_ANIMELIST_DTYPES = {
+    "anime_id": "int32",
+    "watching_status": "int8",
+}
 
 
 class PopularityModel:
@@ -91,6 +103,43 @@ class PopularityModel:
         logger.info("PopularityModel fitted successfully")
         return self
 
+    def fit_from_csv(
+        self,
+        anime_df: pd.DataFrame,
+        ratings_csv_path: Optional[Union[str, Path]] = None,
+        animelist_csv_path: Optional[Union[str, Path]] = None,
+        min_ratings: int = 100,
+        chunk_size: int = 500_000,
+    ) -> "PopularityModel":
+        """
+        Streaming-friendly version of fit() that never loads the full ratings or
+        animelist tables into a DataFrame at once.
+        """
+        self.anime_df = anime_df.copy()
+
+        for _, row in self.anime_df.iterrows():
+            self._anime_info[row['MAL_ID']] = {
+                'mal_id': int(row['MAL_ID']),
+                'name': row['Name'],
+                'english_name': row.get('English name', row['Name']),
+                'genres': row.get('Genres', ''),
+                'score': float(row.get('Score', 0)) if pd.notna(row.get('Score')) else 0,
+                'type': row.get('Type', 'Unknown'),
+                'members': int(row.get('Members', 0)) if pd.notna(row.get('Members')) else 0
+            }
+
+        self._compute_top_rated(min_ratings)
+        self._compute_most_members()
+
+        if ratings_csv_path is not None:
+            self._compute_most_watched_from_csv(ratings_csv_path, chunk_size=chunk_size)
+
+        if animelist_csv_path is not None:
+            self._compute_trending_from_csv(animelist_csv_path, chunk_size=chunk_size)
+
+        logger.info("PopularityModel fitted successfully from CSV streams")
+        return self
+
     def _compute_top_rated(self, min_ratings: int) -> None:
         """Compute top rated anime."""
         logger.info("Computing top rated anime...")
@@ -141,6 +190,51 @@ class PopularityModel:
 
         logger.info(f"Most watched: {len(self._most_watched)} anime")
 
+    def _compute_most_watched_from_csv(
+        self,
+        ratings_csv_path: Union[str, Path],
+        chunk_size: int = 500_000,
+    ) -> None:
+        """Streaming version of most-watched calculation."""
+        logger.info("Computing most watched anime from CSV...")
+
+        rating_counts: Dict[int, int] = defaultdict(int)
+        rating_sums: Dict[int, float] = defaultdict(float)
+
+        for chunk_idx, chunk in enumerate(
+            pd.read_csv(
+                ratings_csv_path,
+                chunksize=chunk_size,
+                usecols=["anime_id", "rating"],
+                dtype=_RATING_DTYPES,
+            ),
+            start=1,
+        ):
+            chunk = chunk.loc[chunk["rating"] > 0, ["anime_id", "rating"]]
+            if chunk.empty:
+                continue
+
+            grouped = chunk.groupby("anime_id")["rating"].agg(["count", "sum"])
+            for anime_id, row in grouped.iterrows():
+                anime_id = int(anime_id)
+                rating_counts[anime_id] += int(row["count"])
+                rating_sums[anime_id] += float(row["sum"])
+
+            if chunk_idx % 20 == 0:
+                logger.info("  Counted rating chunks: %d", chunk_idx)
+
+        self._most_watched = []
+        for anime_id, count in sorted(
+            rating_counts.items(), key=lambda item: item[1], reverse=True
+        )[:500]:
+            if anime_id in self._anime_info:
+                info = self._anime_info[anime_id].copy()
+                info["rating_count"] = int(count)
+                info["avg_rating"] = float(rating_sums[anime_id] / count) if count else 0.0
+                self._most_watched.append(info)
+
+        logger.info(f"Most watched: {len(self._most_watched)} anime")
+
     def _compute_most_members(self) -> None:
         """Compute most popular anime by member count."""
         logger.info("Computing most members anime...")
@@ -181,6 +275,47 @@ class PopularityModel:
             if anime_id in self._anime_info:
                 info = self._anime_info[anime_id].copy()
                 info['watching_count'] = int(trending_counts[anime_id])
+                self._trending.append(info)
+
+        logger.info(f"Trending: {len(self._trending)} anime")
+
+    def _compute_trending_from_csv(
+        self,
+        animelist_csv_path: Union[str, Path],
+        chunk_size: int = 500_000,
+    ) -> None:
+        """Streaming version of trending calculation."""
+        logger.info("Computing trending anime from CSV...")
+
+        trending_counts: Dict[int, int] = defaultdict(int)
+
+        for chunk_idx, chunk in enumerate(
+            pd.read_csv(
+                animelist_csv_path,
+                chunksize=chunk_size,
+                usecols=["anime_id", "watching_status"],
+                dtype=_ANIMELIST_DTYPES,
+            ),
+            start=1,
+        ):
+            current_watching = chunk.loc[chunk["watching_status"] == 1, "anime_id"]
+            if current_watching.empty:
+                continue
+
+            counts = current_watching.value_counts(sort=False)
+            for anime_id, count in counts.items():
+                trending_counts[int(anime_id)] += int(count)
+
+            if chunk_idx % 20 == 0:
+                logger.info("  Counted animelist chunks: %d", chunk_idx)
+
+        self._trending = []
+        for anime_id, count in sorted(
+            trending_counts.items(), key=lambda item: item[1], reverse=True
+        )[:500]:
+            if anime_id in self._anime_info:
+                info = self._anime_info[anime_id].copy()
+                info["watching_count"] = int(count)
                 self._trending.append(info)
 
         logger.info(f"Trending: {len(self._trending)} anime")

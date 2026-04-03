@@ -38,6 +38,12 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+_RATING_DTYPES = {
+    "user_id": "int32",
+    "anime_id": "int32",
+    "rating": "int8",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers — meta-model
@@ -294,6 +300,43 @@ class LearnedHybridEngine:
             self._item_avg_score[int(aid)] = float(row["avg"])
             self._item_num_ratings[int(aid)] = int(row["cnt"])
         logger.info(f"Item stats loaded: {len(stats)} anime")
+
+    def set_item_stats_from_csv(
+        self,
+        ratings_csv_path: Union[str, Path],
+        chunk_size: int = 500_000,
+    ) -> None:
+        """Streaming version of item stat aggregation for large ratings files."""
+        rating_sums: Dict[int, float] = {}
+        rating_counts: Dict[int, int] = {}
+
+        for chunk_idx, chunk in enumerate(
+            pd.read_csv(
+                ratings_csv_path,
+                chunksize=chunk_size,
+                usecols=["anime_id", "rating"],
+                dtype={"anime_id": "int32", "rating": "int8"},
+            ),
+            start=1,
+        ):
+            chunk = chunk.loc[chunk["rating"] > 0, ["anime_id", "rating"]]
+            if chunk.empty:
+                continue
+
+            grouped = chunk.groupby("anime_id")["rating"].agg(["sum", "count"])
+            for anime_id, row in grouped.iterrows():
+                anime_id = int(anime_id)
+                rating_sums[anime_id] = rating_sums.get(anime_id, 0.0) + float(row["sum"])
+                rating_counts[anime_id] = rating_counts.get(anime_id, 0) + int(row["count"])
+
+            if chunk_idx % 20 == 0:
+                logger.info("  Aggregated item stats for %d chunks...", chunk_idx)
+
+        for anime_id, count in rating_counts.items():
+            self._item_num_ratings[anime_id] = int(count)
+            self._item_avg_score[anime_id] = float(rating_sums[anime_id] / count) if count else 0.0
+
+        logger.info(f"Item stats loaded from CSV: {len(rating_counts)} anime")
 
     # ─────────────────────────────────────────────────────────────────
     # Score extraction (per sub-model)
@@ -1263,6 +1306,172 @@ def train_learned_hybrid(
     engine.train(
         train_user_ids=train_user_ids,
         test_interactions=test_interactions,
+        all_anime_ids=all_anime_ids,
+        min_ratings_to_train=min_ratings_to_train,
+        top_users=top_users,
+    )
+
+    if save_dir:
+        engine.save(Path(save_dir))
+
+    return engine
+
+
+def _stream_test_interactions_from_csv(
+    test_ratings_csv_path: Union[str, Path],
+    relevance_threshold: float,
+    chunk_size: int = 500_000,
+) -> Dict[int, List[int]]:
+    """Load held-out positive test items without materializing the whole CSV."""
+    test_interactions: Dict[int, List[int]] = {}
+
+    for chunk in pd.read_csv(
+        test_ratings_csv_path,
+        chunksize=chunk_size,
+        usecols=["user_id", "anime_id", "rating"],
+        dtype=_RATING_DTYPES,
+    ):
+        chunk = chunk.loc[
+            chunk["rating"] >= relevance_threshold, ["user_id", "anime_id"]
+        ]
+        if chunk.empty:
+            continue
+
+        for user_id, group in chunk.groupby("user_id", sort=False):
+            user_id = int(user_id)
+            items = group["anime_id"].astype(np.int64).tolist()
+            if user_id in test_interactions:
+                test_interactions[user_id].extend(items)
+            else:
+                test_interactions[user_id] = items
+
+    return test_interactions
+
+
+def _stream_user_rating_counts_from_csv(
+    train_ratings_csv_path: Union[str, Path],
+    chunk_size: int = 500_000,
+) -> Dict[int, int]:
+    """Count ratings per user from the train split CSV."""
+    user_counts: Dict[int, int] = {}
+
+    for chunk in pd.read_csv(
+        train_ratings_csv_path,
+        chunksize=chunk_size,
+        usecols=["user_id", "rating"],
+        dtype={"user_id": "int32", "rating": "int8"},
+    ):
+        counts = chunk["user_id"].value_counts(sort=False)
+        for user_id, count in counts.items():
+            user_id = int(user_id)
+            user_counts[user_id] = user_counts.get(user_id, 0) + int(count)
+
+    return user_counts
+
+
+def _stream_selected_user_histories_from_csv(
+    train_ratings_csv_path: Union[str, Path],
+    selected_users: Set[int],
+    chunk_size: int = 500_000,
+) -> Dict[int, Dict[int, float]]:
+    """Load train histories only for the users selected for meta-model training."""
+    user_histories: Dict[int, Dict[int, float]] = {int(uid): {} for uid in selected_users}
+
+    if not user_histories:
+        return user_histories
+
+    for chunk in pd.read_csv(
+        train_ratings_csv_path,
+        chunksize=chunk_size,
+        usecols=["user_id", "anime_id", "rating"],
+        dtype=_RATING_DTYPES,
+    ):
+        chunk = chunk.loc[chunk["user_id"].isin(selected_users)]
+        if chunk.empty:
+            continue
+
+        for row in chunk.itertuples(index=False):
+            user_histories[int(row.user_id)][int(row.anime_id)] = float(row.rating)
+
+    return user_histories
+
+
+def train_learned_hybrid_from_csv(
+    content_model,
+    collaborative_model,
+    implicit_model,
+    popularity_model,
+    anime_df: pd.DataFrame,
+    train_ratings_csv_path: Union[str, Path],
+    test_ratings_csv_path: Union[str, Path],
+    all_ratings_csv_path: Union[str, Path],
+    save_dir: Optional[Union[str, Path]] = None,
+    min_ratings_to_train: int = 20,
+    top_users: int = 3000,
+    relevance_threshold: float = 7.0,
+    chunk_size: int = 500_000,
+) -> "LearnedHybridEngine":
+    """
+    Streaming-friendly learned-hybrid training for full-dataset runs.
+    """
+    engine = LearnedHybridEngine(
+        content_model=content_model,
+        collaborative_model=collaborative_model,
+        implicit_model=implicit_model,
+        popularity_model=popularity_model,
+        relevance_threshold=relevance_threshold,
+    )
+
+    engine.set_anime_info(anime_df)
+    engine.set_item_stats_from_csv(all_ratings_csv_path, chunk_size=chunk_size)
+
+    logger.info("Loading held-out positives from %s...", test_ratings_csv_path)
+    test_interactions = _stream_test_interactions_from_csv(
+        test_ratings_csv_path,
+        relevance_threshold=relevance_threshold,
+        chunk_size=chunk_size,
+    )
+
+    logger.info("Counting train interactions per user from %s...", train_ratings_csv_path)
+    user_counts = _stream_user_rating_counts_from_csv(
+        train_ratings_csv_path,
+        chunk_size=chunk_size,
+    )
+
+    eligible = [
+        (user_id, user_counts.get(user_id, 0))
+        for user_id in test_interactions.keys()
+        if user_counts.get(user_id, 0) >= min_ratings_to_train
+    ]
+    eligible.sort(key=lambda item: -item[1])
+    selected_users = {user_id for user_id, _ in eligible[:top_users]}
+
+    logger.info(
+        "Learned hybrid selected %d/%d eligible users (min_ratings=%d, top_users=%d)",
+        len(selected_users),
+        len(eligible),
+        min_ratings_to_train,
+        top_users,
+    )
+
+    user_histories = _stream_selected_user_histories_from_csv(
+        train_ratings_csv_path,
+        selected_users,
+        chunk_size=chunk_size,
+    )
+    for user_id, ratings in user_histories.items():
+        engine.set_user_history(user_id, ratings=ratings)
+
+    filtered_test_interactions = {
+        user_id: items
+        for user_id, items in test_interactions.items()
+        if user_id in selected_users
+    }
+    all_anime_ids = anime_df["MAL_ID"].astype(int).tolist()
+
+    engine.train(
+        train_user_ids=list(selected_users),
+        test_interactions=filtered_test_interactions,
         all_anime_ids=all_anime_ids,
         min_ratings_to_train=min_ratings_to_train,
         top_users=top_users,

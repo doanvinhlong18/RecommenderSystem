@@ -1,6 +1,8 @@
 """
 Matrix builder for constructing sparse user-item matrices.
 """
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 import logging
@@ -15,6 +17,19 @@ from config import CACHE_DIR, data_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_RATING_DTYPES = {
+    "user_id": "int32",
+    "anime_id": "int32",
+    "rating": "int8",
+}
+
+_ANIMELIST_DTYPES = {
+    "user_id": "int32",
+    "anime_id": "int32",
+    "watching_status": "int8",
+    "watched_episodes": "int32",
+}
 
 
 class MatrixBuilder:
@@ -107,6 +122,145 @@ class MatrixBuilder:
         col_indices = df['anime_id'].map(self.anime_to_idx).values
         ratings = df['rating'].values.astype(np.float32)
 
+        self.user_item_matrix = csr_matrix(
+            (ratings, (row_indices, col_indices)),
+            shape=(self.n_users, self.n_items),
+        )
+        self.item_user_matrix = self.user_item_matrix.T.tocsr()
+
+        logger.info(f"Rating matrix built: {self.user_item_matrix.nnz:,} non-zero entries")
+        logger.info(
+            f"Sparsity: {1 - self.user_item_matrix.nnz / (self.n_users * self.n_items):.4%}"
+        )
+        return self.user_item_matrix
+
+    def build_rating_matrix_from_csv(
+        self,
+        filepath: Union[str, Path],
+        min_user_ratings: int = None,
+        min_anime_ratings: int = None,
+        chunk_size: int = 500_000,
+    ) -> csr_matrix:
+        """
+        Build the explicit rating matrix directly from CSV, without loading the
+        whole file into a pandas DataFrame.
+        """
+        filepath = Path(filepath)
+        min_user_ratings = min_user_ratings or data_config.min_user_ratings
+        min_anime_ratings = min_anime_ratings or data_config.min_anime_ratings
+
+        logger.info("Building rating matrix from CSV: %s", filepath)
+
+        user_counts: Dict[int, int] = defaultdict(int)
+        anime_counts: Dict[int, int] = defaultdict(int)
+
+        for chunk_idx, chunk in enumerate(
+            pd.read_csv(
+                filepath,
+                chunksize=chunk_size,
+                usecols=["user_id", "anime_id", "rating"],
+                dtype=_RATING_DTYPES,
+            ),
+            start=1,
+        ):
+            chunk = chunk.loc[chunk["rating"] > 0, ["user_id", "anime_id", "rating"]]
+            if chunk.empty:
+                continue
+
+            user_vc = chunk["user_id"].value_counts(sort=False)
+            anime_vc = chunk["anime_id"].value_counts(sort=False)
+
+            for user_id, count in user_vc.items():
+                user_counts[int(user_id)] += int(count)
+            for anime_id, count in anime_vc.items():
+                anime_counts[int(anime_id)] += int(count)
+
+            if chunk_idx % 20 == 0:
+                logger.info("  Counted ratings for %d chunks...", chunk_idx)
+
+        valid_users = {
+            user_id
+            for user_id, count in user_counts.items()
+            if count >= min_user_ratings
+        }
+        valid_anime = {
+            anime_id
+            for anime_id, count in anime_counts.items()
+            if count >= min_anime_ratings
+        }
+
+        self.user_to_idx = {
+            int(uid): idx for idx, uid in enumerate(sorted(valid_users))
+        }
+        self.idx_to_user = {idx: uid for uid, idx in self.user_to_idx.items()}
+        self.anime_to_idx = {
+            int(aid): idx for idx, aid in enumerate(sorted(valid_anime))
+        }
+        self.idx_to_anime = {idx: aid for aid, idx in self.anime_to_idx.items()}
+
+        self.n_users = len(self.user_to_idx)
+        self.n_items = len(self.anime_to_idx)
+
+        logger.info(
+            "After CSV filters: %d users x %d items",
+            self.n_users,
+            self.n_items,
+        )
+        if self.n_users == 0 or self.n_items == 0:
+            raise ValueError(
+                "Rating matrix is empty after applying the minimum user/item filters. "
+                "Use a larger split or lower min_user_ratings/min_anime_ratings."
+            )
+
+        valid_user_set = set(self.user_to_idx.keys())
+        valid_anime_set = set(self.anime_to_idx.keys())
+        row_parts = []
+        col_parts = []
+        rating_parts = []
+        total_rows = 0
+
+        for chunk_idx, chunk in enumerate(
+            pd.read_csv(
+                filepath,
+                chunksize=chunk_size,
+                usecols=["user_id", "anime_id", "rating"],
+                dtype=_RATING_DTYPES,
+            ),
+            start=1,
+        ):
+            chunk = chunk.loc[chunk["rating"] > 0, ["user_id", "anime_id", "rating"]]
+            if chunk.empty:
+                continue
+
+            chunk = chunk.loc[
+                chunk["user_id"].isin(valid_user_set)
+                & chunk["anime_id"].isin(valid_anime_set)
+            ]
+            if chunk.empty:
+                continue
+
+            row_parts.append(
+                chunk["user_id"].map(self.user_to_idx).to_numpy(dtype=np.int32, copy=False)
+            )
+            col_parts.append(
+                chunk["anime_id"].map(self.anime_to_idx).to_numpy(dtype=np.int32, copy=False)
+            )
+            rating_parts.append(
+                chunk["rating"].to_numpy(dtype=np.float32, copy=False)
+            )
+            total_rows += len(chunk)
+
+            if chunk_idx % 20 == 0:
+                logger.info("  Materialized ratings for %d chunks...", chunk_idx)
+
+        if not rating_parts:
+            raise ValueError("No valid explicit interactions were found in the split CSV.")
+
+        row_indices = np.concatenate(row_parts)
+        col_indices = np.concatenate(col_parts)
+        ratings = np.concatenate(rating_parts)
+
+        self.n_ratings = int(total_rows)
         self.user_item_matrix = csr_matrix(
             (ratings, (row_indices, col_indices)),
             shape=(self.n_users, self.n_items),
@@ -234,6 +388,92 @@ class MatrixBuilder:
         self.implicit_matrix = csr_matrix(
             (all_scores_np, (all_rows_np, all_cols_np)),
             shape=(n_users, n_items),
+        )
+
+        logger.info(f"Implicit matrix built: {self.implicit_matrix.nnz:,} entries")
+        return self.implicit_matrix
+
+    def build_implicit_matrix_from_csv(
+        self,
+        filepath: Union[str, Path],
+        watching_status_df: Optional[pd.DataFrame] = None,
+        chunk_size: int = 500_000,
+    ) -> csr_matrix:
+        """
+        Build the implicit matrix directly from a filtered animelist CSV.
+        """
+        filepath = Path(filepath)
+        logger.info("Building implicit matrix from CSV: %s", filepath)
+
+        if not self.user_to_idx or not self.anime_to_idx:
+            raise ValueError(
+                "Explicit rating mappings must be built before reading implicit CSV data."
+            )
+
+        user_set = set(self.user_to_idx.keys())
+        anime_set = set(self.anime_to_idx.keys())
+
+        status_weights = {
+            1: 0.8,
+            2: 1.0,
+            3: 0.5,
+            4: 0.2,
+            6: 0.1,
+        }
+
+        row_parts = []
+        col_parts = []
+        score_parts = []
+
+        for chunk_idx, chunk in enumerate(
+            pd.read_csv(
+                filepath,
+                chunksize=chunk_size,
+                usecols=["user_id", "anime_id", "watching_status", "watched_episodes"],
+                dtype=_ANIMELIST_DTYPES,
+            ),
+            start=1,
+        ):
+            chunk = chunk.loc[
+                chunk["user_id"].isin(user_set) & chunk["anime_id"].isin(anime_set)
+            ]
+            if chunk.empty:
+                continue
+
+            status_w = chunk["watching_status"].map(status_weights).fillna(0.1)
+            episode_w = (
+                np.log1p(chunk["watched_episodes"].fillna(0).astype(np.float32)) / 10
+            ).clip(0, 1)
+            scores = (status_w * 0.6 + episode_w * 0.4).astype(np.float32)
+
+            row_parts.append(
+                chunk["user_id"].map(self.user_to_idx).to_numpy(dtype=np.int32, copy=False)
+            )
+            col_parts.append(
+                chunk["anime_id"].map(self.anime_to_idx).to_numpy(dtype=np.int32, copy=False)
+            )
+            score_parts.append(
+                scores.to_numpy(dtype=np.float32, copy=False)
+            )
+
+            if chunk_idx % 20 == 0:
+                logger.info("  Materialized implicit rows for %d chunks...", chunk_idx)
+
+        if not score_parts:
+            self.implicit_matrix = csr_matrix(
+                (self.n_users, self.n_items),
+                dtype=np.float32,
+            )
+            logger.info("Implicit matrix built: 0 entries")
+            return self.implicit_matrix
+
+        row_indices = np.concatenate(row_parts)
+        col_indices = np.concatenate(col_parts)
+        scores = np.concatenate(score_parts)
+
+        self.implicit_matrix = csr_matrix(
+            (scores, (row_indices, col_indices)),
+            shape=(self.n_users, self.n_items),
         )
 
         logger.info(f"Implicit matrix built: {self.implicit_matrix.nnz:,} entries")

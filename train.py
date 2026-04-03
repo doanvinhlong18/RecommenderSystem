@@ -37,9 +37,13 @@ from preprocessing import (
     MatrixBuilder,
     TextProcessor,
     ContentFeatureBuilder,
+    create_ratings_disk_split,
     create_ratings_user_split,
     extract_holdout_ratings_df,
+    filter_animelist_to_disk,
     filter_holdout_interactions,
+    get_ratings_disk_split,
+    load_ratings_disk_split,
     load_ratings_user_split,
     save_ratings_user_split,
     split_to_ratings_df,
@@ -51,7 +55,11 @@ from models.implicit import ALSImplicit
 from models.popularity import PopularityModel
 
 # LearnedHybridEngine là engine duy nhất — không import HybridEngine nữa
-from models.hybrid.learned_hybrid import LearnedHybridEngine, train_learned_hybrid
+from models.hybrid.learned_hybrid import (
+    LearnedHybridEngine,
+    train_learned_hybrid,
+    train_learned_hybrid_from_csv,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -223,6 +231,32 @@ def train_popularity_model(anime_df, ratings_df, animelist_df) -> PopularityMode
     return model
 
 
+def train_popularity_model_from_csv(
+    anime_df,
+    ratings_csv_path: Path,
+    animelist_csv_path: Path,
+    chunk_size: int = 500_000,
+) -> PopularityModel:
+    """Train popularity model from streamed CSV inputs."""
+    logger.info("=" * 50)
+    logger.info("Training Popularity Model")
+    logger.info("=" * 50)
+
+    start_time = time.time()
+    model = PopularityModel()
+    model.fit_from_csv(
+        anime_df,
+        ratings_csv_path=ratings_csv_path,
+        animelist_csv_path=animelist_csv_path,
+        chunk_size=chunk_size,
+    )
+
+    elapsed = time.time() - start_time
+    logger.info(f"Popularity Model trained in {elapsed:.2f} seconds")
+
+    return model
+
+
 def load_or_create_training_split(
     loader: DataLoader,
     split_path: Path,
@@ -259,7 +293,60 @@ def load_or_create_training_split(
     return split_artifact, train_ratings_df
 
 
+def load_or_create_training_disk_split(
+    loader: DataLoader,
+    split_path: Path,
+    force_resplit: bool = False,
+    test_ratio: float = None,
+    relevance_threshold: float = 7.0,
+    min_train_items: int = 10,
+    min_test_items: int = 3,
+    leave_one_out: bool = False,
+    chunk_size: int = 500_000,
+):
+    """Create or reuse a streaming-friendly split stored as CSV artifacts on disk."""
+    expected_split = get_ratings_disk_split(split_path)
+    split_exists = (
+        expected_split.manifest_path.exists()
+        and expected_split.train_ratings_path.exists()
+        and expected_split.test_ratings_path.exists()
+        and expected_split.train_animelist_path.exists()
+    )
+
+    if split_exists and not force_resplit:
+        disk_split = load_ratings_disk_split(split_path)
+        logger.info("Reusing persisted on-disk split: %s", split_path)
+        return disk_split
+
+    ratings_csv_path = loader.dataset_path / data_config.rating_file
+    animelist_csv_path = loader.dataset_path / data_config.animelist_file
+
+    logger.info("Creating persisted on-disk split at %s", split_path)
+    disk_split = create_ratings_disk_split(
+        ratings_csv_path=ratings_csv_path,
+        split_path=split_path,
+        min_train_items=min_train_items,
+        min_test_items=min_test_items,
+        test_ratio=test_ratio if test_ratio is not None else eval_config.test_size,
+        relevance_threshold=relevance_threshold,
+        leave_one_out=leave_one_out,
+        random_state=eval_config.random_state,
+        chunk_size=chunk_size,
+    )
+
+    filter_animelist_to_disk(
+        animelist_csv_path=animelist_csv_path,
+        test_ratings_path=disk_split.test_ratings_path,
+        output_csv_path=disk_split.train_animelist_path,
+        chunk_size=chunk_size,
+    )
+    return load_ratings_disk_split(split_path)
+
+
 def main():
+    default_split_path = str(SPLITS_DIR / "ratings_user_split.pkl")
+    default_full_split_path = SPLITS_DIR / "full_train_split.json"
+
     parser = argparse.ArgumentParser(description="Train Anime Recommendation Models")
     parser.add_argument(
         "--skip-sbert", action="store_true", help="Skip SBERT embeddings"
@@ -280,6 +367,12 @@ def main():
         help="Chunk size when building the implicit matrix",
     )
     parser.add_argument(
+        "--stream-chunk-size",
+        type=int,
+        default=500_000,
+        help="Chunk size for CSV streaming and on-disk split generation",
+    )
+    parser.add_argument(
         "--cf-method",
         type=str,
         default="bpr",
@@ -290,7 +383,7 @@ def main():
     parser.add_argument(
         "--split-path",
         type=str,
-        default=str(SPLITS_DIR / "ratings_user_split.pkl"),
+        default=default_split_path,
         help="Path to the persisted train/eval split artifact",
     )
     parser.add_argument(
@@ -355,6 +448,12 @@ def main():
 
     loader = DataLoader()
     split_path = Path(args.split_path)
+    if not use_sample and args.split_path == default_split_path:
+        split_path = default_full_split_path
+        logger.info(
+            "Using full-data split artifact path: %s",
+            split_path,
+        )
 
     anime_df = loader.get_merged_anime_data()
     logger.info(f"Anime data: {len(anime_df)} records")
@@ -362,36 +461,64 @@ def main():
     content_anime_df = loader.get_content_base_dataframe()
     logger.info(f"Content anime data: {len(content_anime_df)} records")
 
-    # Load ratings một lần duy nhất — dùng lại cho cả train và train_learned_hybrid
-    ratings_df = loader.load_ratings(sample=use_sample)
-    logger.info(f"Ratings loaded: {len(ratings_df):,} records")
+    ratings_df = None
+    train_ratings_df = None
+    train_animelist_df = None
+    split_artifact = None
+    disk_split = None
+    all_ratings_csv_path = loader.dataset_path / data_config.rating_file
 
-    split_artifact, train_ratings_df = load_or_create_training_split(
-        loader,
-        split_path=split_path,
-        ratings_df=ratings_df,
-        force_resplit=args.force_resplit,
-        test_ratio=args.test_ratio,
-        relevance_threshold=args.relevance_threshold,
-        min_train_items=args.min_train_items,
-        min_test_items=args.min_test_items,
-        leave_one_out=args.leave_one_out,
-    )
-    logger.info(
-        "Persisted split ready at %s (%s eval users, %s held-out items)",
-        split_path,
-        split_artifact.metadata.get("eval_users", len(split_artifact.eval_users)),
-        split_artifact.metadata.get("test_interactions", 0),
-    )
+    if use_sample:
+        # Sample path keeps the existing in-memory workflow for quick iteration.
+        ratings_df = loader.load_ratings(sample=True)
+        logger.info(f"Ratings loaded: {len(ratings_df):,} records")
 
-    animelist_df = loader.load_animelist(sample=use_sample)
-    logger.info(f"Animelist: {len(animelist_df):,} records")
-    train_animelist_df = filter_holdout_interactions(
-        animelist_df, split_artifact.user_test
-    )
-    logger.info(
-        f"Animelist after removing held-out pairs: {len(train_animelist_df):,} records"
-    )
+        split_artifact, train_ratings_df = load_or_create_training_split(
+            loader,
+            split_path=split_path,
+            ratings_df=ratings_df,
+            force_resplit=args.force_resplit,
+            test_ratio=args.test_ratio,
+            relevance_threshold=args.relevance_threshold,
+            min_train_items=args.min_train_items,
+            min_test_items=args.min_test_items,
+            leave_one_out=args.leave_one_out,
+        )
+        logger.info(
+            "Persisted split ready at %s (%s eval users, %s held-out items)",
+            split_path,
+            split_artifact.metadata.get("eval_users", len(split_artifact.eval_users)),
+            split_artifact.metadata.get("test_interactions", 0),
+        )
+
+        animelist_df = loader.load_animelist(sample=True)
+        logger.info(f"Animelist: {len(animelist_df):,} records")
+        train_animelist_df = filter_holdout_interactions(
+            animelist_df, split_artifact.user_test
+        )
+        logger.info(
+            f"Animelist after removing held-out pairs: {len(train_animelist_df):,} records"
+        )
+    else:
+        # Full-data path uses streamed CSV splits written to disk, so we never keep
+        # the full ratings/animelist tables in memory at once.
+        disk_split = load_or_create_training_disk_split(
+            loader,
+            split_path=split_path,
+            force_resplit=args.force_resplit,
+            test_ratio=args.test_ratio,
+            relevance_threshold=args.relevance_threshold,
+            min_train_items=args.min_train_items,
+            min_test_items=args.min_test_items,
+            leave_one_out=args.leave_one_out,
+            chunk_size=args.stream_chunk_size,
+        )
+        logger.info(
+            "Persisted on-disk split ready at %s (%s eval users, %s held-out items)",
+            disk_split.manifest_path,
+            disk_split.metadata.get("eval_users", 0),
+            disk_split.metadata.get("test_interactions", 0),
+        )
 
     # ===== BUILD MATRICES =====
     logger.info("=" * 50)
@@ -399,11 +526,31 @@ def main():
     logger.info("=" * 50)
 
     matrix_builder = MatrixBuilder()
-    matrix_builder.build_rating_matrix(train_ratings_df)
-    matrix_builder.build_implicit_matrix(
-        train_animelist_df,
-        chunk_size=args.implicit_chunk_size,
+    if use_sample:
+        matrix_builder.build_rating_matrix(train_ratings_df)
+    else:
+        matrix_builder.build_rating_matrix_from_csv(
+            disk_split.train_ratings_path,
+            chunk_size=args.stream_chunk_size,
+        )
+
+    need_implicit_matrix = (not args.skip_implicit) or (
+        not args.skip_collaborative and args.cf_method == "bpr"
     )
+    if need_implicit_matrix:
+        if use_sample:
+            matrix_builder.build_implicit_matrix(
+                train_animelist_df,
+                chunk_size=args.implicit_chunk_size,
+            )
+        else:
+            matrix_builder.build_implicit_matrix_from_csv(
+                disk_split.train_animelist_path,
+                chunk_size=args.implicit_chunk_size,
+            )
+    else:
+        logger.info("Skipping implicit matrix build (not needed by selected models)")
+        matrix_builder.implicit_matrix = None
 
     # ===== TRAIN MODELS =====
 
@@ -448,11 +595,19 @@ def main():
         logger.info("Skipping Collaborative Filtering")
 
     # 4. Popularity
-    popularity_model = train_popularity_model(
-        anime_df, train_ratings_df, train_animelist_df
-    )
-    del animelist_df
-    del train_animelist_df
+    if use_sample:
+        popularity_model = train_popularity_model(
+            anime_df, train_ratings_df, train_animelist_df
+        )
+        del animelist_df
+        del train_animelist_df
+    else:
+        popularity_model = train_popularity_model_from_csv(
+            anime_df,
+            ratings_csv_path=disk_split.train_ratings_path,
+            animelist_csv_path=disk_split.train_animelist_path,
+            chunk_size=args.stream_chunk_size,
+        )
 
     # ===== TRAIN LEARNED HYBRID ENGINE =====
     # Đây là engine duy nhất — lưu tất cả models vào saved_models/learned_hybrid/
@@ -463,25 +618,42 @@ def main():
     save_dir = MODELS_DIR / "learned_hybrid"
 
     if not args.skip_learned_hybrid:
-        test_ratings_df = extract_holdout_ratings_df(
-            ratings_df,
-            split_artifact.user_test,
-        )
+        if use_sample:
+            test_ratings_df = extract_holdout_ratings_df(
+                ratings_df,
+                split_artifact.user_test,
+            )
 
-        learned_engine = train_learned_hybrid(
-            content_model=content_model,
-            collaborative_model=collaborative_model,
-            implicit_model=implicit_model,
-            popularity_model=popularity_model,
-            anime_df=anime_df,
-            train_ratings_df=train_ratings_df,
-            test_ratings_df=test_ratings_df,
-            all_ratings_df=ratings_df,  # dùng lại ratings đã load — không load lại
-            save_dir=save_dir,
-            min_ratings_to_train=args.learned_hybrid_min_ratings,
-            top_users=args.learned_hybrid_top_users,
-            relevance_threshold=args.relevance_threshold,
-        )
+            learned_engine = train_learned_hybrid(
+                content_model=content_model,
+                collaborative_model=collaborative_model,
+                implicit_model=implicit_model,
+                popularity_model=popularity_model,
+                anime_df=anime_df,
+                train_ratings_df=train_ratings_df,
+                test_ratings_df=test_ratings_df,
+                all_ratings_df=ratings_df,
+                save_dir=save_dir,
+                min_ratings_to_train=args.learned_hybrid_min_ratings,
+                top_users=args.learned_hybrid_top_users,
+                relevance_threshold=args.relevance_threshold,
+            )
+        else:
+            learned_engine = train_learned_hybrid_from_csv(
+                content_model=content_model,
+                collaborative_model=collaborative_model,
+                implicit_model=implicit_model,
+                popularity_model=popularity_model,
+                anime_df=anime_df,
+                train_ratings_csv_path=disk_split.train_ratings_path,
+                test_ratings_csv_path=disk_split.test_ratings_path,
+                all_ratings_csv_path=all_ratings_csv_path,
+                save_dir=save_dir,
+                min_ratings_to_train=args.learned_hybrid_min_ratings,
+                top_users=args.learned_hybrid_top_users,
+                relevance_threshold=args.relevance_threshold,
+                chunk_size=args.stream_chunk_size,
+            )
 
         fi = learned_engine.get_feature_importance()
         if fi:
