@@ -28,18 +28,22 @@ Usage:
 import argparse
 import json
 import logging
+import pickle
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+import pandas as pd
 import sys
+from scipy.sparse import csr_matrix, load_npz
 
 sys.path.append(str(Path(__file__).parent))
 
 from config import MODELS_DIR, SPLITS_DIR, eval_config
-from preprocessing import load_ratings_user_split
+from preprocessing import load_ratings_disk_split, load_ratings_user_split
 from models.content import ContentBasedRecommender
 from models.collaborative import MatrixFactorization
 from models.implicit import ALSImplicit
@@ -51,6 +55,12 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+_RATING_DTYPES = {
+    "user_id": "int32",
+    "anime_id": "int32",
+    "rating": "int8",
+}
 
 
 # =============================================================================
@@ -208,6 +218,247 @@ def aggregate(
     return summary
 
 
+@dataclass
+class EvaluationData:
+    """Unified evaluation access for both legacy pickle splits and on-disk CSV splits."""
+
+    eval_users: List[int]
+    metadata: Dict
+    split_format: str
+    user_train: Optional[Dict[int, Dict[int, float]]] = None
+    user_test: Optional[Dict[int, Set[int]]] = None
+    train_matrix: Optional[csr_matrix] = None
+    test_matrix: Optional[csr_matrix] = None
+    user_to_idx: Optional[Dict[int, int]] = None
+    anime_to_idx: Optional[Dict[int, int]] = None
+    idx_to_anime: Optional[Dict[int, int]] = None
+
+    def get_train_items(self, user_id: int) -> Dict[int, float]:
+        if self.user_train is not None:
+            return self.user_train.get(user_id, {})
+
+        if (
+            self.train_matrix is None
+            or self.user_to_idx is None
+            or self.idx_to_anime is None
+        ):
+            return {}
+
+        user_idx = self.user_to_idx.get(user_id)
+        if user_idx is None:
+            return {}
+
+        row = self.train_matrix.getrow(user_idx)
+        return {
+            int(self.idx_to_anime[int(item_idx)]): float(rating)
+            for item_idx, rating in zip(row.indices, row.data)
+        }
+
+    def get_train_item_ids(self, user_id: int) -> Set[int]:
+        if self.user_train is not None:
+            return set(self.user_train.get(user_id, {}).keys())
+        return set(self.get_train_items(user_id).keys())
+
+    def get_test_items(self, user_id: int) -> Set[int]:
+        if self.user_test is not None:
+            return self.user_test.get(user_id, set())
+
+        if (
+            self.test_matrix is None
+            or self.user_to_idx is None
+            or self.idx_to_anime is None
+        ):
+            return set()
+
+        user_idx = self.user_to_idx.get(user_id)
+        if user_idx is None:
+            return set()
+
+        row = self.test_matrix.getrow(user_idx)
+        return {int(self.idx_to_anime[int(item_idx)]) for item_idx in row.indices}
+
+
+def _load_saved_train_matrix_context(matrix_dir: Path) -> Tuple[csr_matrix, Dict, Dict, Dict]:
+    """Load the saved explicit train matrix and mappings from train.py output."""
+    matrix_dir = Path(matrix_dir)
+    matrix_path = matrix_dir / "user_item_matrix.npz"
+    mappings_path = matrix_dir / "mappings.pkl"
+
+    if not matrix_path.exists() or not mappings_path.exists():
+        raise FileNotFoundError(
+            f"Saved train matrices not found in {matrix_dir}. Run train.py first."
+        )
+
+    train_matrix = load_npz(matrix_path)
+    with open(mappings_path, "rb") as f:
+        mappings = pickle.load(f)
+
+    return (
+        train_matrix,
+        mappings["user_to_idx"],
+        mappings["anime_to_idx"],
+        mappings["idx_to_anime"],
+    )
+
+
+def _load_eval_users_from_test_csv(
+    test_ratings_path: Path,
+    chunk_size: int = 500_000,
+) -> List[int]:
+    """Collect the unique evaluation users from the on-disk held-out CSV."""
+    eval_users: Set[int] = set()
+
+    for chunk in pd.read_csv(
+        test_ratings_path,
+        chunksize=chunk_size,
+        usecols=["user_id"],
+        dtype={"user_id": "int32"},
+    ):
+        eval_users.update(chunk["user_id"].astype(np.int64).tolist())
+
+    return sorted(int(user_id) for user_id in eval_users)
+
+
+def _build_test_matrix_from_csv(
+    test_ratings_path: Path,
+    user_to_idx: Dict[int, int],
+    anime_to_idx: Dict[int, int],
+    selected_users: Set[int],
+    chunk_size: int = 500_000,
+) -> csr_matrix:
+    """Build a sparse held-out test matrix aligned to the saved train mappings."""
+    row_parts: List[np.ndarray] = []
+    col_parts: List[np.ndarray] = []
+
+    for chunk_idx, chunk in enumerate(
+        pd.read_csv(
+            test_ratings_path,
+            chunksize=chunk_size,
+            usecols=["user_id", "anime_id"],
+            dtype={"user_id": "int32", "anime_id": "int32"},
+        ),
+        start=1,
+    ):
+        chunk = chunk.loc[
+            chunk["user_id"].isin(selected_users)
+            & chunk["anime_id"].isin(anime_to_idx)
+        ]
+        if chunk.empty:
+            continue
+
+        mapped_users = chunk["user_id"].map(user_to_idx)
+        mapped_items = chunk["anime_id"].map(anime_to_idx)
+        valid_mask = mapped_users.notna() & mapped_items.notna()
+        if not valid_mask.any():
+            continue
+        chunk = chunk.loc[valid_mask]
+        mapped_users = mapped_users.loc[valid_mask]
+        mapped_items = mapped_items.loc[valid_mask]
+
+        row_parts.append(
+            mapped_users.to_numpy(dtype=np.int32, copy=False)
+        )
+        col_parts.append(
+            mapped_items.to_numpy(dtype=np.int32, copy=False)
+        )
+
+        if chunk_idx % 20 == 0:
+            logger.info("  Built test matrix rows for %d chunks...", chunk_idx)
+
+    if not row_parts:
+        return csr_matrix((len(user_to_idx), len(anime_to_idx)), dtype=np.float32)
+
+    row_indices = np.concatenate(row_parts)
+    col_indices = np.concatenate(col_parts)
+    data = np.ones(len(row_indices), dtype=np.float32)
+
+    return csr_matrix(
+        (data, (row_indices, col_indices)),
+        shape=(len(user_to_idx), len(anime_to_idx)),
+    )
+
+
+def load_split_for_evaluation(
+    split_path: Path,
+    sample_users: int,
+    chunk_size: int = 500_000,
+    matrix_dir: Path = MODELS_DIR / "matrices",
+) -> EvaluationData:
+    """Load either the legacy pickle split or the newer on-disk streaming split."""
+    legacy_error = None
+
+    try:
+        split_artifact = load_ratings_user_split(split_path)
+        eval_users = list(split_artifact.eval_users)
+        if len(eval_users) > sample_users:
+            rng = np.random.default_rng(
+                int(
+                    split_artifact.metadata.get(
+                        "random_state", eval_config.random_state
+                    )
+                )
+            )
+            eval_users = list(rng.choice(eval_users, sample_users, replace=False))
+
+        return EvaluationData(
+            eval_users=eval_users,
+            metadata=split_artifact.metadata,
+            split_format="legacy_pickle",
+            user_train=split_artifact.user_train,
+            user_test=split_artifact.user_test,
+        )
+    except Exception as exc:
+        legacy_error = exc
+
+    try:
+        disk_split = load_ratings_disk_split(split_path)
+    except Exception as disk_error:
+        raise RuntimeError(
+            f"Could not load split artifact as legacy pickle or on-disk manifest.\n"
+            f"Legacy error: {legacy_error}\n"
+            f"Disk error: {disk_error}"
+        ) from disk_error
+
+    all_eval_users = _load_eval_users_from_test_csv(
+        disk_split.test_ratings_path,
+        chunk_size=chunk_size,
+    )
+    eval_users = all_eval_users
+    if len(eval_users) > sample_users:
+        rng = np.random.default_rng(
+            int(disk_split.metadata.get("random_state", eval_config.random_state))
+        )
+        eval_users = list(rng.choice(eval_users, sample_users, replace=False))
+
+    train_matrix, user_to_idx, anime_to_idx, idx_to_anime = _load_saved_train_matrix_context(
+        matrix_dir
+    )
+    test_matrix = _build_test_matrix_from_csv(
+        disk_split.test_ratings_path,
+        user_to_idx=user_to_idx,
+        anime_to_idx=anime_to_idx,
+        selected_users=set(int(user_id) for user_id in eval_users),
+        chunk_size=chunk_size,
+    )
+    if eval_users and test_matrix.nnz == 0:
+        logger.warning(
+            "The on-disk split loaded successfully, but none of the sampled users "
+            "mapped into the saved train matrix. Make sure the split artifact and "
+            "saved_models/matrices come from the same train run."
+        )
+
+    return EvaluationData(
+        eval_users=list(int(user_id) for user_id in eval_users),
+        metadata=disk_split.metadata,
+        split_format="disk_manifest",
+        train_matrix=train_matrix,
+        test_matrix=test_matrix,
+        user_to_idx=user_to_idx,
+        anime_to_idx=anime_to_idx,
+        idx_to_anime=idx_to_anime,
+    )
+
+
 # =============================================================================
 # 1. Content-Based
 # =============================================================================
@@ -215,9 +466,7 @@ def aggregate(
 
 def evaluate_content_model(
     content_model: ContentBasedRecommender,
-    user_train: Dict[int, Dict[int, float]],
-    user_test: Dict[int, Set[int]],
-    eval_users: List[int],
+    eval_data: EvaluationData,
     k_values: List[int],
     max_users: int = 500,
     anime_info: Optional[Dict] = None,
@@ -232,9 +481,11 @@ def evaluate_content_model(
     results = {k: defaultdict(list) for k in k_values}
     evaluated = 0
 
+    eval_users = eval_data.eval_users
+
     for i, user_id in enumerate(eval_users[:max_users]):
-        train_items = user_train.get(user_id, {})
-        test_items = user_test.get(user_id, set())
+        train_items = eval_data.get_train_items(user_id)
+        test_items = eval_data.get_test_items(user_id)
         if not train_items or not test_items:
             continue
 
@@ -279,9 +530,7 @@ def evaluate_content_model(
 
 def evaluate_collaborative_model(
     collab_model: MatrixFactorization,
-    user_train: Dict[int, Dict[int, float]],
-    user_test: Dict[int, Set[int]],
-    eval_users: List[int],
+    eval_data: EvaluationData,
     k_values: List[int],
     max_users: int = 500,
     anime_info: Optional[Dict] = None,
@@ -297,9 +546,11 @@ def evaluate_collaborative_model(
     evaluated = 0
     skipped_not_in_model = 0
 
+    eval_users = eval_data.eval_users
+
     for i, user_id in enumerate(eval_users[:max_users]):
-        train_items = user_train.get(user_id, {})
-        test_items = user_test.get(user_id, set())
+        train_items = eval_data.get_train_items(user_id)
+        test_items = eval_data.get_test_items(user_id)
         if not test_items:
             continue
 
@@ -353,9 +604,7 @@ def evaluate_collaborative_model(
 
 def evaluate_implicit_model(
     implicit_model: ALSImplicit,
-    user_train: Dict[int, Dict[int, float]],
-    user_test: Dict[int, Set[int]],
-    eval_users: List[int],
+    eval_data: EvaluationData,
     k_values: List[int],
     max_users: int = 500,
     anime_info: Optional[Dict] = None,
@@ -382,9 +631,11 @@ def evaluate_implicit_model(
     evaluated = 0
     skip_oob = 0
 
+    eval_users = eval_data.eval_users
+
     for i, user_id in enumerate(eval_users[:max_users]):
-        train_items = set(user_train.get(user_id, {}).keys())
-        test_items = user_test.get(user_id, set())
+        train_items = eval_data.get_train_item_ids(user_id)
+        test_items = eval_data.get_test_items(user_id)
         if not test_items:
             continue
         if user_id not in implicit_model.user_to_idx:
@@ -435,9 +686,7 @@ def evaluate_implicit_model(
 
 def evaluate_popularity_model(
     popularity_model: PopularityModel,
-    user_train: Dict[int, Dict[int, float]],
-    user_test: Dict[int, Set[int]],
-    eval_users: List[int],
+    eval_data: EvaluationData,
     k_values: List[int],
     max_users: int = 500,
     anime_info: Optional[Dict] = None,
@@ -461,9 +710,11 @@ def evaluate_popularity_model(
     results = {k: defaultdict(list) for k in k_values}
     evaluated = 0
 
+    eval_users = eval_data.eval_users
+
     for i, user_id in enumerate(eval_users[:max_users]):
-        train_items = user_train.get(user_id, {})
-        test_items = user_test.get(user_id, set())
+        train_items = eval_data.get_train_items(user_id)
+        test_items = eval_data.get_test_items(user_id)
         if not test_items:
             continue
 
@@ -493,9 +744,7 @@ def evaluate_popularity_model(
 
 def evaluate_learned_hybrid(
     engine: LearnedHybridEngine,
-    user_train: Dict[int, Dict[int, float]],
-    user_test: Dict[int, Set[int]],
-    eval_users: List[int],
+    eval_data: EvaluationData,
     k_values: List[int],
     max_users: int = 500,
     anime_info: Optional[Dict] = None,
@@ -520,9 +769,11 @@ def evaluate_learned_hybrid(
     skip_cold = 0
     skip_norecs = 0
 
+    eval_users = eval_data.eval_users
+
     for i, user_id in enumerate(eval_users[:max_users]):
-        train_items = user_train.get(user_id, {})
-        test_items = user_test.get(user_id, set())
+        train_items = eval_data.get_train_items(user_id)
+        test_items = eval_data.get_test_items(user_id)
         if not test_items:
             continue
 
@@ -670,12 +921,19 @@ def find_best_model(all_results: Dict, k: int, metric: str = "ndcg") -> Tuple:
 
 
 def main():
+    default_split_path = SPLITS_DIR / "ratings_user_split.pkl"
+    default_full_split_path = SPLITS_DIR / "full_train_split.json"
+
     parser = argparse.ArgumentParser(description="Evaluate all recommendation models")
     parser.add_argument("--sample-users", type=int, default=500)
     parser.add_argument("--k", type=int, nargs="+", default=[5, 10, 20])
     parser.add_argument("--output", type=str, default="model_evaluation_results.json")
+    parser.add_argument("--split-path", type=str, default=str(default_split_path))
     parser.add_argument(
-        "--split-path", type=str, default=str(SPLITS_DIR / "ratings_user_split.pkl")
+        "--split-chunk-size",
+        type=int,
+        default=500_000,
+        help="Chunk size for reading on-disk split CSV artifacts",
     )
 
     parser.add_argument("--skip-content", action="store_true")
@@ -714,27 +972,32 @@ def main():
     # ─────────────────────────────────────────────────────────────────────
     print("\n[1/3] Loading split artifact...")
     split_path = Path(args.split_path)
+    if (
+        args.split_path == str(default_split_path)
+        and not split_path.exists()
+        and default_full_split_path.exists()
+    ):
+        split_path = default_full_split_path
+        print(f"  Using full-data split manifest: {split_path}")
+
     if not split_path.exists():
         print(f"  ERROR: {split_path} not found — run train.py first")
         return
 
-    split_artifact = load_ratings_user_split(split_path)
-    user_train = split_artifact.user_train
-    user_test = split_artifact.user_test
-    eval_users = list(split_artifact.eval_users)
-
-    if len(eval_users) > args.sample_users:
-        rng = np.random.default_rng(
-            int(split_artifact.metadata.get("random_state", eval_config.random_state))
-        )
-        eval_users = list(rng.choice(eval_users, args.sample_users, replace=False))
+    eval_data = load_split_for_evaluation(
+        split_path,
+        sample_users=args.sample_users,
+        chunk_size=args.split_chunk_size,
+    )
+    eval_users = eval_data.eval_users
 
     print(
-        f"  Train interactions : {split_artifact.metadata.get('train_interactions', 'N/A')}"
+        f"  Split format       : {eval_data.split_format}"
     )
     print(
-        f"  Test interactions  : {split_artifact.metadata.get('test_interactions', 'N/A')}"
+        f"  Train interactions : {eval_data.metadata.get('train_interactions', 'N/A')}"
     )
+    print(f"  Test interactions  : {eval_data.metadata.get('test_interactions', 'N/A')}")
     print(f"  Eval users (used)  : {len(eval_users)}")
 
     # ─────────────────────────────────────────────────────────────────────
@@ -835,9 +1098,7 @@ def main():
         t0 = time.time()
         all_results["Content"] = evaluate_content_model(
             content_model,
-            user_train,
-            user_test,
-            eval_users,
+            eval_data,
             args.k,
             args.sample_users,
             ai,
@@ -849,9 +1110,7 @@ def main():
         t0 = time.time()
         all_results["Collaborative"] = evaluate_collaborative_model(
             collaborative_model,
-            user_train,
-            user_test,
-            eval_users,
+            eval_data,
             args.k,
             args.sample_users,
             ai,
@@ -863,9 +1122,7 @@ def main():
         t0 = time.time()
         all_results["Implicit"] = evaluate_implicit_model(
             implicit_model,
-            user_train,
-            user_test,
-            eval_users,
+            eval_data,
             args.k,
             args.sample_users,
             ai,
@@ -877,9 +1134,7 @@ def main():
         t0 = time.time()
         all_results["Popularity"] = evaluate_popularity_model(
             popularity_model,
-            user_train,
-            user_test,
-            eval_users,
+            eval_data,
             args.k,
             args.sample_users,
             ai,
@@ -891,9 +1146,7 @@ def main():
         t0 = time.time()
         all_results["LearnedHybrid"] = evaluate_learned_hybrid(
             learned_engine,
-            user_train,
-            user_test,
-            eval_users,
+            eval_data,
             args.k,
             args.sample_users,
             ai,
@@ -938,6 +1191,7 @@ def main():
             "sample_users": args.sample_users,
             "k_values": args.k,
             "split_path": str(split_path),
+            "split_format": eval_data.split_format,
             "diversity": not args.no_diversity,
         },
         "results": all_results,
