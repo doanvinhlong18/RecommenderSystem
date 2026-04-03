@@ -82,6 +82,8 @@ class MatrixFactorization:
         verify_negative_samples: bool = None,
         use_implicit_signal: bool = None,
         warm_start_from_als: bool = None,
+        device: Optional[str] = None,
+        use_torch: Optional[bool] = None,
     ):
         self.method = method.lower()
 
@@ -124,11 +126,13 @@ class MatrixFactorization:
         # Device configuration
         self.device = device or get_device()
 
-        # Auto-detect whether to use PyTorch
-        if use_torch is None:
-            self.use_torch = TORCH_AVAILABLE and (method == "torch" or is_gpu_available())
+        # PyTorch only applies to explicit MF backends, never to BPR.
+        if self.method == "bpr":
+            self.use_torch = False
+        elif use_torch is None:
+            self.use_torch = TORCH_AVAILABLE and is_gpu_available()
         else:
-            self.use_torch = use_torch and TORCH_AVAILABLE
+            self.use_torch = bool(use_torch and TORCH_AVAILABLE)
 
         # PyTorch model
         self._torch_model: Optional[TorchMatrixFactorization] = None

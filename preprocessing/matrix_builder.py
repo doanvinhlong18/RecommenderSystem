@@ -97,6 +97,12 @@ class MatrixBuilder:
 
         logger.info(f"Matrix dimensions: {self.n_users:,} users x {self.n_items:,} items")
 
+        if self.n_users == 0 or self.n_items == 0:
+            raise ValueError(
+                "Rating matrix is empty after applying the minimum user/item filters. "
+                "Use a larger sample or lower min_user_ratings/min_anime_ratings."
+            )
+
         row_indices = df['user_id'].map(self.user_to_idx).values
         col_indices = df['anime_id'].map(self.anime_to_idx).values
         ratings = df['rating'].values.astype(np.float32)

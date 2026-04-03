@@ -9,6 +9,7 @@ from .content_feature_builder import ContentFeatureBuilder
 from .data_splitter import (
     RatingsUserSplit,
     create_ratings_user_split,
+    extract_holdout_ratings_df,
     split_to_ratings_df,
     filter_holdout_interactions,
     save_ratings_user_split,
@@ -22,6 +23,7 @@ __all__ = [
     "ContentFeatureBuilder",
     "RatingsUserSplit",
     "create_ratings_user_split",
+    "extract_holdout_ratings_df",
     "split_to_ratings_df",
     "filter_holdout_interactions",
     "save_ratings_user_split",

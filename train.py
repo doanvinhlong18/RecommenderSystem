@@ -38,6 +38,7 @@ from preprocessing import (
     TextProcessor,
     ContentFeatureBuilder,
     create_ratings_user_split,
+    extract_holdout_ratings_df,
     filter_holdout_interactions,
     load_ratings_user_split,
     save_ratings_user_split,
@@ -125,6 +126,7 @@ def train_collaborative_model(
     implicit_matrix=None,
     implicit_model=None,
     positive_rating_threshold: float = None,
+    device: str = None,
 ) -> MatrixFactorization:
     """Train collaborative filtering model with GPU support."""
     logger.info("=" * 50)
@@ -132,6 +134,7 @@ def train_collaborative_model(
     logger.info("=" * 50)
 
     start_time = time.time()
+    device = device or get_device()
 
     if method == "bpr":
         model = MatrixFactorization(
@@ -144,6 +147,7 @@ def train_collaborative_model(
             verify_negative_samples=model_config.bpr_verify_negative_samples,
             use_implicit_signal=model_config.bpr_use_implicit_signal,
             warm_start_from_als=model_config.bpr_warm_start_from_als,
+            device=device,
         )
     else:
         model = MatrixFactorization(
@@ -152,6 +156,7 @@ def train_collaborative_model(
             learning_rate=model_config.svd_lr,
             regularization=model_config.svd_reg,
             method=method,
+            device=device,
         )
 
     model.fit(
@@ -221,6 +226,7 @@ def train_popularity_model(anime_df, ratings_df, animelist_df) -> PopularityMode
 def load_or_create_training_split(
     loader: DataLoader,
     split_path: Path,
+    ratings_df=None,
     force_resplit: bool = False,
     test_ratio: float = None,
     relevance_threshold: float = 7.0,
@@ -232,7 +238,7 @@ def load_or_create_training_split(
         split_artifact = load_ratings_user_split(split_path)
         logger.info("Reusing persisted split: %s", split_path)
     else:
-        ratings_df = loader.load_ratings(sample=True)
+        ratings_df = ratings_df if ratings_df is not None else loader.load_ratings(sample=False)
         split_artifact = create_ratings_user_split(
             ratings_df,
             min_train_items=min_train_items,
@@ -268,6 +274,12 @@ def main():
         "--sample-size", type=int, default=None, help="Sample size for ratings"
     )
     parser.add_argument(
+        "--implicit-chunk-size",
+        type=int,
+        default=500_000,
+        help="Chunk size when building the implicit matrix",
+    )
+    parser.add_argument(
         "--cf-method",
         type=str,
         default="bpr",
@@ -295,6 +307,18 @@ def main():
     parser.add_argument("--min-test-items", type=int, default=3)
     parser.add_argument("--leave-one-out", action="store_true")
     parser.add_argument(
+        "--learned-hybrid-min-ratings",
+        type=int,
+        default=20,
+        help="Minimum ratings per user to include when training the learned hybrid",
+    )
+    parser.add_argument(
+        "--learned-hybrid-top-users",
+        type=int,
+        default=3000,
+        help="Maximum number of active users used to train the learned hybrid",
+    )
+    parser.add_argument(
         "--skip-learned-hybrid",
         action="store_true",
         help="Bỏ qua bước train meta-model (tiết kiệm thời gian khi test)",
@@ -314,9 +338,15 @@ def main():
         else "Running in CPU fallback mode"
     )
 
-    if args.sample_size:
+    use_sample = args.sample_size is not None
+    if use_sample:
         data_config.rating_sample_size = args.sample_size
         data_config.animelist_sample_size = args.sample_size
+        logger.info("Sample mode enabled: %s rows", args.sample_size)
+    else:
+        data_config.rating_sample_size = None
+        data_config.animelist_sample_size = None
+        logger.info("Full-data mode enabled")
 
     # ===== LOAD DATA =====
     logger.info("=" * 50)
@@ -333,12 +363,13 @@ def main():
     logger.info(f"Content anime data: {len(content_anime_df)} records")
 
     # Load ratings một lần duy nhất — dùng lại cho cả train và train_learned_hybrid
-    ratings_df = loader.load_ratings(sample=True)
+    ratings_df = loader.load_ratings(sample=use_sample)
     logger.info(f"Ratings loaded: {len(ratings_df):,} records")
 
     split_artifact, train_ratings_df = load_or_create_training_split(
         loader,
         split_path=split_path,
+        ratings_df=ratings_df,
         force_resplit=args.force_resplit,
         test_ratio=args.test_ratio,
         relevance_threshold=args.relevance_threshold,
@@ -353,7 +384,7 @@ def main():
         split_artifact.metadata.get("test_interactions", 0),
     )
 
-    animelist_df = loader.load_animelist(sample=True)
+    animelist_df = loader.load_animelist(sample=use_sample)
     logger.info(f"Animelist: {len(animelist_df):,} records")
     train_animelist_df = filter_holdout_interactions(
         animelist_df, split_artifact.user_test
@@ -369,7 +400,10 @@ def main():
 
     matrix_builder = MatrixBuilder()
     matrix_builder.build_rating_matrix(train_ratings_df)
-    matrix_builder.build_implicit_matrix(train_animelist_df)
+    matrix_builder.build_implicit_matrix(
+        train_animelist_df,
+        chunk_size=args.implicit_chunk_size,
+    )
 
     # ===== TRAIN MODELS =====
 
@@ -377,6 +411,7 @@ def main():
     content_model = train_content_model(
         content_anime_df, use_sbert=not args.skip_sbert, device=device
     )
+    clear_gpu_cache()
 
     # 2. Implicit Feedback
     if not args.skip_implicit:
@@ -388,6 +423,7 @@ def main():
             matrix_builder.idx_to_user,
             device=device,
         )
+        clear_gpu_cache()
     else:
         implicit_model = None
         logger.info("Skipping Implicit Feedback Model")
@@ -404,7 +440,9 @@ def main():
             implicit_matrix=matrix_builder.implicit_matrix,
             implicit_model=implicit_model,
             positive_rating_threshold=args.relevance_threshold,
+            device=device,
         )
+        clear_gpu_cache()
     else:
         collaborative_model = None
         logger.info("Skipping Collaborative Filtering")
@@ -413,6 +451,8 @@ def main():
     popularity_model = train_popularity_model(
         anime_df, train_ratings_df, train_animelist_df
     )
+    del animelist_df
+    del train_animelist_df
 
     # ===== TRAIN LEARNED HYBRID ENGINE =====
     # Đây là engine duy nhất — lưu tất cả models vào saved_models/learned_hybrid/
@@ -423,7 +463,10 @@ def main():
     save_dir = MODELS_DIR / "learned_hybrid"
 
     if not args.skip_learned_hybrid:
-        test_ratings_df = split_to_ratings_df(split_artifact.user_test)
+        test_ratings_df = extract_holdout_ratings_df(
+            ratings_df,
+            split_artifact.user_test,
+        )
 
         learned_engine = train_learned_hybrid(
             content_model=content_model,
@@ -435,8 +478,8 @@ def main():
             test_ratings_df=test_ratings_df,
             all_ratings_df=ratings_df,  # dùng lại ratings đã load — không load lại
             save_dir=save_dir,
-            min_ratings_to_train=20,
-            top_users=3000,
+            min_ratings_to_train=args.learned_hybrid_min_ratings,
+            top_users=args.learned_hybrid_top_users,
             relevance_threshold=args.relevance_threshold,
         )
 

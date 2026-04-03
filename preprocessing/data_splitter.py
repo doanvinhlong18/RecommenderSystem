@@ -176,30 +176,86 @@ def filter_holdout_interactions(
     if interactions_df.empty or not user_test:
         return interactions_df.copy()
 
-    holdout_pairs = [
-        (int(user_id), int(anime_id))
+    holdout_lookup = {
+        int(user_id): {int(anime_id) for anime_id in items}
         for user_id, items in user_test.items()
-        for anime_id in items
-    ]
-
-    if not holdout_pairs:
+        if items
+    }
+    if not holdout_lookup:
         return interactions_df.copy()
 
-    holdout_index = pd.MultiIndex.from_tuples(
-        holdout_pairs,
-        names=[user_col, item_col],
-    )
-    interaction_index = pd.MultiIndex.from_frame(
-        interactions_df[[user_col, item_col]].astype(np.int64)
-    )
-    mask = ~interaction_index.isin(holdout_index)
+    holdout_users = list(holdout_lookup.keys())
+    candidate_mask = interactions_df[user_col].isin(holdout_users).to_numpy()
+    if not candidate_mask.any():
+        return interactions_df.copy()
 
-    filtered_df = interactions_df.loc[mask].copy()
+    keep_mask = np.ones(len(interactions_df), dtype=bool)
+    candidate_df = interactions_df.loc[candidate_mask, [user_col, item_col]].copy()
+    candidate_df["_pos"] = np.flatnonzero(candidate_mask)
+
+    for user_id, group in candidate_df.groupby(user_col, sort=False):
+        held_out_items = holdout_lookup.get(int(user_id))
+        if not held_out_items:
+            continue
+
+        drop_positions = group.loc[
+            group[item_col].isin(held_out_items), "_pos"
+        ].to_numpy(dtype=np.int64, copy=False)
+        keep_mask[drop_positions] = False
+
+    filtered_df = interactions_df.loc[keep_mask].copy()
     logger.info(
         "Filtered %d held-out rows from the interaction table",
         len(interactions_df) - len(filtered_df),
     )
     return filtered_df
+
+
+def extract_holdout_ratings_df(
+    ratings_df: pd.DataFrame,
+    user_test: Dict[int, Set[int]],
+    user_col: str = "user_id",
+    item_col: str = "anime_id",
+    rating_col: str = "rating",
+) -> pd.DataFrame:
+    """
+    Recover the held-out ratings rows that correspond to `user_test`.
+
+    This is primarily used by the learned hybrid meta-model, which needs the
+    original rating values of the held-out positives instead of just the item IDs.
+    """
+    empty_cols = [user_col, item_col, rating_col]
+    if ratings_df.empty or not user_test:
+        return pd.DataFrame(columns=empty_cols)
+
+    holdout_lookup = {
+        int(user_id): {int(anime_id) for anime_id in items}
+        for user_id, items in user_test.items()
+        if items
+    }
+    if not holdout_lookup:
+        return pd.DataFrame(columns=empty_cols)
+
+    candidate_mask = ratings_df[user_col].isin(list(holdout_lookup.keys()))
+    candidate_df = ratings_df.loc[candidate_mask, empty_cols].copy()
+    if candidate_df.empty:
+        return candidate_df
+
+    matched_parts = []
+    for user_id, group in candidate_df.groupby(user_col, sort=False):
+        held_out_items = holdout_lookup.get(int(user_id))
+        if not held_out_items:
+            continue
+        matched = group.loc[group[item_col].isin(held_out_items)]
+        if not matched.empty:
+            matched_parts.append(matched)
+
+    if not matched_parts:
+        return pd.DataFrame(columns=empty_cols)
+
+    holdout_df = pd.concat(matched_parts, ignore_index=True)
+    logger.info("Extracted %d held-out rating rows", len(holdout_df))
+    return holdout_df
 
 
 def save_ratings_user_split(split: RatingsUserSplit, filepath: Union[str, Path]) -> None:

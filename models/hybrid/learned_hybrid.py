@@ -544,7 +544,7 @@ class LearnedHybridEngine:
             logger.info("LightGBM không có — dùng LogisticRegression fallback")
             self._meta_model = _build_sklearn_meta()
 
-        self._meta_model.fit(X, y)
+        self._meta_model.fit(self._prepare_meta_input(X), y)
         self._meta_trained = True
         self._log_feature_importance()
         logger.info("Meta-model training done.")
@@ -601,11 +601,18 @@ class LearnedHybridEngine:
 
         X, valid = self._build_X(user_id, aids)
         try:
-            proba = self._meta_model.predict_proba(X)[:, 1]
+            proba = self._meta_model.predict_proba(self._prepare_meta_input(X))[:, 1]
             return {a: float(p) for a, p in zip(valid, proba)}
         except Exception as e:
             logger.warning(f"Meta predict error: {e} — fallback to weighted sum")
             return self._weighted_sum(user_id, aids)
+
+    def _prepare_meta_input(self, X: np.ndarray):
+        """Keep LightGBM inference consistent with the feature names seen at fit time."""
+        lgb = _try_import_lgbm()
+        if lgb and isinstance(self._meta_model, lgb.LGBMClassifier):
+            return pd.DataFrame(X, columns=FEATURE_NAMES)
+        return X
 
     # ─────────────────────────────────────────────────────────────────
     # recommend_similar_anime — cascade
@@ -1003,7 +1010,9 @@ class LearnedHybridEngine:
         if self._meta_trained:
             try:
                 X, _ = self._build_X(user_id, [anime_id])
-                proba = float(self._meta_model.predict_proba(X)[0, 1])
+                proba = float(
+                    self._meta_model.predict_proba(self._prepare_meta_input(X))[0, 1]
+                )
                 explanation["reasons"].append(
                     {
                         "type": "meta_model",
