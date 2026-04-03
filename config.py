@@ -38,8 +38,8 @@ class DataConfig:
 
     # Sampling settings for large datasets
     sample_ratings: bool = False
-    rating_sample_size: int = None  # 5M samples for development
-    animelist_sample_size: int = None  # 10M samples
+    rating_sample_size: int = None
+    animelist_sample_size: int = None
 
     # Minimum thresholds
     min_user_ratings: int = 15
@@ -81,16 +81,21 @@ class ModelConfig:
     implicit_regularization: float = 0.01
 
     # FAISS settings
-    faiss_nlist: int = 100  # Number of clusters for IVF
-    faiss_nprobe: int = 10  # Number of clusters to search
+    faiss_nlist: int = 100
+    faiss_nprobe: int = 10
 
-    # Hybrid weights
+    # Hybrid weights — CẬP NHẬT dựa trên evaluation results (Precision@10):
+    #   Implicit ALS:      0.265  → weight 0.50
+    #   Collaborative BPR: 0.093  → weight 0.25
+    #   Content-Based:     0.073  → weight 0.20
+    #   Popularity:        0.050  → weight 0.05
+    # Đây là fallback_weights cho LearnedHybridEngine khi meta-model chưa train.
     hybrid_weights: Dict[str, float] = field(
         default_factory=lambda: {
-            "content": 0.25,
-            "collaborative": 0.3,
-            "implicit": 0.35,
-            "popularity": 0.1,
+            "content": 0.20,
+            "collaborative": 0.25,
+            "implicit": 0.50,
+            "popularity": 0.05,
         }
     )
 
