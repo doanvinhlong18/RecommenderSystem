@@ -412,7 +412,10 @@ class LearnedHybridEngine:
         try:
             fetch_k = max(200, len(aids))
             recs = self.implicit_model.recommend_for_user(
-                user_id, top_k=fetch_k, exclude_known=False
+                user_id,
+                top_k=fetch_k,
+                exclude_known=False,
+                use_diversity=False,
             )
             rec_map = {r["mal_id"]: float(r.get("score", 0.0)) for r in recs}
             max_s = max(rec_map.values(), default=1.0)
@@ -546,7 +549,7 @@ class LearnedHybridEngine:
                 logger.debug(f"Skip user {uid}: {e}")
                 continue
 
-            if (i + 1) % 200 == 0:
+            if (i + 1) % 50 == 0:
                 logger.info(
                     f"  {i+1}/{len(users_to_use)} users ({time.time()-t0:.0f}s)"
                 )

@@ -343,6 +343,108 @@ def load_or_create_training_disk_split(
     return load_ratings_disk_split(split_path)
 
 
+def save_training_checkpoint(
+    save_dir: Path,
+    anime_df,
+    content_model=None,
+    collaborative_model=None,
+    implicit_model=None,
+    popularity_model=None,
+    learned_engine=None,
+    reason: str = "",
+):
+    """Persist the currently available models so training can resume later."""
+    if reason:
+        logger.info("Saving checkpoint after %s...", reason)
+    else:
+        logger.info("Saving checkpoint...")
+
+    engine = learned_engine
+    if engine is None:
+        engine = LearnedHybridEngine(
+            content_model=content_model,
+            collaborative_model=collaborative_model,
+            implicit_model=implicit_model,
+            popularity_model=popularity_model,
+        )
+        if anime_df is not None:
+            engine.set_anime_info(anime_df)
+    elif anime_df is not None and not getattr(engine, "_anime_info", None):
+        engine.set_anime_info(anime_df)
+
+    engine.save(save_dir)
+    logger.info("Checkpoint saved to %s", save_dir)
+    return engine
+
+
+def load_existing_models_for_hybrid(save_dir: Path) -> LearnedHybridEngine:
+    """Load previously trained base models for a hybrid-only stage."""
+    if not save_dir.exists():
+        raise FileNotFoundError(
+            f"{save_dir} not found. Train the base models first before running hybrid-only."
+        )
+
+    engine = LearnedHybridEngine()
+    engine.load(save_dir)
+    if not any(
+        [
+            engine.content_model is not None,
+            engine.collaborative_model is not None,
+            engine.implicit_model is not None,
+            engine.popularity_model is not None,
+        ]
+    ):
+        raise ValueError(
+            f"No base models were found in {save_dir}. Train the base stage first."
+        )
+    return engine
+
+
+def run_quick_test(
+    learned_engine: LearnedHybridEngine,
+    matrix_builder: MatrixBuilder,
+    popularity_model: PopularityModel,
+):
+    """Small post-train sanity check."""
+    if learned_engine is None or matrix_builder is None or popularity_model is None:
+        logger.info("Skipping quick test because the required artifacts are not available")
+        return
+    if not matrix_builder.user_to_idx:
+        logger.info("Skipping quick test because matrix mappings are empty")
+        return
+
+    logger.info("\n" + "=" * 50)
+    logger.info("Quick Test")
+    logger.info("=" * 50)
+
+    test_anime = "Naruto"
+    print(f"\nRecommendations similar to '{test_anime}':")
+    recs = learned_engine.recommend_similar_anime(test_anime, top_k=5)
+    for rec in recs:
+        print(
+            f"  - {rec['name']} (Score: {rec['score']}, Hybrid: {rec['hybrid_score']:.4f})"
+        )
+
+    test_user = list(matrix_builder.user_to_idx.keys())[0]
+    test_user_ratings = matrix_builder.get_user_ratings(test_user)
+    learned_engine.set_user_history(
+        test_user,
+        ratings=test_user_ratings,
+        watched=set(test_user_ratings.keys()),
+    )
+    print(f"\nRecommendations for user {test_user}:")
+    user_recs = learned_engine.recommend_for_user(test_user, top_k=5)
+    for rec in user_recs:
+        print(
+            f"  - {rec['name']} (Hybrid: {rec['hybrid_score']:.4f}, strategy: {rec.get('strategy','?')})"
+        )
+
+    print("\nTop Rated Anime:")
+    popular = popularity_model.get_top_rated(5)
+    for p in popular:
+        print(f"  - {p['name']} (Score: {p['score']})")
+
+
 def main():
     default_split_path = str(SPLITS_DIR / "ratings_user_split.pkl")
     default_full_split_path = SPLITS_DIR / "full_train_split.json"
@@ -416,9 +518,19 @@ def main():
         action="store_true",
         help="Bỏ qua bước train meta-model (tiết kiệm thời gian khi test)",
     )
+    parser.add_argument(
+        "--stage",
+        type=str,
+        default="all",
+        choices=["all", "base", "hybrid"],
+        help="Train all stages, only base models, or only the learned hybrid stage",
+    )
 
     args = parser.parse_args()
     total_start = time.time()
+
+    if args.stage == "hybrid" and args.skip_learned_hybrid:
+        raise ValueError("--stage hybrid cannot be used together with --skip-learned-hybrid")
 
     # ===== INITIALIZE DEVICE =====
     logger.info("=" * 50)
@@ -441,6 +553,11 @@ def main():
         data_config.animelist_sample_size = None
         logger.info("Full-data mode enabled")
 
+    train_base_stage = args.stage in {"all", "base"}
+    train_hybrid_stage = args.stage in {"all", "hybrid"} and not args.skip_learned_hybrid
+    save_dir = MODELS_DIR / "learned_hybrid"
+    matrix_dir = MODELS_DIR / "matrices"
+
     # ===== LOAD DATA =====
     logger.info("=" * 50)
     logger.info("Loading Data")
@@ -453,6 +570,10 @@ def main():
         logger.info(
             "Using full-data split artifact path: %s",
             split_path,
+        )
+    if args.stage == "hybrid" and args.force_resplit:
+        raise ValueError(
+            "Hybrid-only stage cannot regenerate the split. Reuse the same split from the base-model run."
         )
 
     anime_df = loader.get_merged_anime_data()
@@ -467,6 +588,11 @@ def main():
     split_artifact = None
     disk_split = None
     all_ratings_csv_path = loader.dataset_path / data_config.rating_file
+
+    if args.stage == "hybrid" and not split_path.exists():
+        raise FileNotFoundError(
+            f"{split_path} not found. Train the base stage first so hybrid uses the same split."
+        )
 
     if use_sample:
         # Sample path keeps the existing in-memory workflow for quick iteration.
@@ -520,203 +646,250 @@ def main():
             disk_split.metadata.get("test_interactions", 0),
         )
 
-    # ===== BUILD MATRICES =====
-    logger.info("=" * 50)
-    logger.info("Building Matrices")
-    logger.info("=" * 50)
+    matrix_builder = None
+    content_model = None
+    collaborative_model = None
+    implicit_model = None
+    popularity_model = None
+    learned_engine = None
+    matrices_saved = False
 
-    matrix_builder = MatrixBuilder()
-    if use_sample:
-        matrix_builder.build_rating_matrix(train_ratings_df)
-    else:
-        matrix_builder.build_rating_matrix_from_csv(
-            disk_split.train_ratings_path,
-            chunk_size=args.stream_chunk_size,
-        )
+    try:
+        if train_base_stage:
+            # ===== BUILD MATRICES =====
+            logger.info("=" * 50)
+            logger.info("Building Matrices")
+            logger.info("=" * 50)
 
-    need_implicit_matrix = (not args.skip_implicit) or (
-        not args.skip_collaborative and args.cf_method == "bpr"
-    )
-    if need_implicit_matrix:
-        if use_sample:
-            matrix_builder.build_implicit_matrix(
-                train_animelist_df,
-                chunk_size=args.implicit_chunk_size,
+            matrix_builder = MatrixBuilder()
+            if use_sample:
+                matrix_builder.build_rating_matrix(train_ratings_df)
+            else:
+                matrix_builder.build_rating_matrix_from_csv(
+                    disk_split.train_ratings_path,
+                    chunk_size=args.stream_chunk_size,
+                )
+
+            need_implicit_matrix = (not args.skip_implicit) or (
+                not args.skip_collaborative and args.cf_method == "bpr"
             )
-        else:
-            matrix_builder.build_implicit_matrix_from_csv(
-                disk_split.train_animelist_path,
-                chunk_size=args.implicit_chunk_size,
+            if need_implicit_matrix:
+                if use_sample:
+                    matrix_builder.build_implicit_matrix(
+                        train_animelist_df,
+                        chunk_size=args.implicit_chunk_size,
+                    )
+                else:
+                    matrix_builder.build_implicit_matrix_from_csv(
+                        disk_split.train_animelist_path,
+                        chunk_size=args.implicit_chunk_size,
+                    )
+            else:
+                logger.info("Skipping implicit matrix build (not needed by selected models)")
+                matrix_builder.implicit_matrix = None
+
+            matrix_builder.save(matrix_dir)
+            matrices_saved = True
+
+            # ===== TRAIN BASE MODELS =====
+            content_model = train_content_model(
+                content_anime_df, use_sbert=not args.skip_sbert, device=device
             )
-    else:
-        logger.info("Skipping implicit matrix build (not needed by selected models)")
-        matrix_builder.implicit_matrix = None
-
-    # ===== TRAIN MODELS =====
-
-    # 1. Content-Based
-    content_model = train_content_model(
-        content_anime_df, use_sbert=not args.skip_sbert, device=device
-    )
-    clear_gpu_cache()
-
-    # 2. Implicit Feedback
-    if not args.skip_implicit:
-        implicit_model = train_implicit_model(
-            matrix_builder.implicit_matrix,
-            matrix_builder.anime_to_idx,
-            matrix_builder.idx_to_anime,
-            matrix_builder.user_to_idx,
-            matrix_builder.idx_to_user,
-            device=device,
-        )
-        clear_gpu_cache()
-    else:
-        implicit_model = None
-        logger.info("Skipping Implicit Feedback Model")
-
-    # 3. Collaborative Filtering
-    if not args.skip_collaborative:
-        collaborative_model = train_collaborative_model(
-            matrix_builder.user_item_matrix,
-            matrix_builder.anime_to_idx,
-            matrix_builder.idx_to_anime,
-            matrix_builder.user_to_idx,
-            matrix_builder.idx_to_user,
-            method=args.cf_method,
-            implicit_matrix=matrix_builder.implicit_matrix,
-            implicit_model=implicit_model,
-            positive_rating_threshold=args.relevance_threshold,
-            device=device,
-        )
-        clear_gpu_cache()
-    else:
-        collaborative_model = None
-        logger.info("Skipping Collaborative Filtering")
-
-    # 4. Popularity
-    if use_sample:
-        popularity_model = train_popularity_model(
-            anime_df, train_ratings_df, train_animelist_df
-        )
-        del animelist_df
-        del train_animelist_df
-    else:
-        popularity_model = train_popularity_model_from_csv(
-            anime_df,
-            ratings_csv_path=disk_split.train_ratings_path,
-            animelist_csv_path=disk_split.train_animelist_path,
-            chunk_size=args.stream_chunk_size,
-        )
-
-    # ===== TRAIN LEARNED HYBRID ENGINE =====
-    # Đây là engine duy nhất — lưu tất cả models vào saved_models/learned_hybrid/
-    logger.info("=" * 50)
-    logger.info("Training Learned Hybrid Engine (meta-model)")
-    logger.info("=" * 50)
-
-    save_dir = MODELS_DIR / "learned_hybrid"
-
-    if not args.skip_learned_hybrid:
-        if use_sample:
-            test_ratings_df = extract_holdout_ratings_df(
-                ratings_df,
-                split_artifact.user_test,
+            clear_gpu_cache()
+            learned_engine = save_training_checkpoint(
+                save_dir,
+                anime_df,
+                content_model=content_model,
+                reason="content model",
             )
 
-            learned_engine = train_learned_hybrid(
+            if not args.skip_implicit:
+                implicit_model = train_implicit_model(
+                    matrix_builder.implicit_matrix,
+                    matrix_builder.anime_to_idx,
+                    matrix_builder.idx_to_anime,
+                    matrix_builder.user_to_idx,
+                    matrix_builder.idx_to_user,
+                    device=device,
+                )
+                clear_gpu_cache()
+                learned_engine = save_training_checkpoint(
+                    save_dir,
+                    anime_df,
+                    content_model=content_model,
+                    implicit_model=implicit_model,
+                    reason="implicit model",
+                )
+            else:
+                logger.info("Skipping Implicit Feedback Model")
+
+            if not args.skip_collaborative:
+                collaborative_model = train_collaborative_model(
+                    matrix_builder.user_item_matrix,
+                    matrix_builder.anime_to_idx,
+                    matrix_builder.idx_to_anime,
+                    matrix_builder.user_to_idx,
+                    matrix_builder.idx_to_user,
+                    method=args.cf_method,
+                    implicit_matrix=matrix_builder.implicit_matrix,
+                    implicit_model=implicit_model,
+                    positive_rating_threshold=args.relevance_threshold,
+                    device=device,
+                )
+                clear_gpu_cache()
+                learned_engine = save_training_checkpoint(
+                    save_dir,
+                    anime_df,
+                    content_model=content_model,
+                    collaborative_model=collaborative_model,
+                    implicit_model=implicit_model,
+                    reason="collaborative model",
+                )
+            else:
+                logger.info("Skipping Collaborative Filtering")
+
+            if use_sample:
+                popularity_model = train_popularity_model(
+                    anime_df, train_ratings_df, train_animelist_df
+                )
+                del animelist_df
+                del train_animelist_df
+            else:
+                popularity_model = train_popularity_model_from_csv(
+                    anime_df,
+                    ratings_csv_path=disk_split.train_ratings_path,
+                    animelist_csv_path=disk_split.train_animelist_path,
+                    chunk_size=args.stream_chunk_size,
+                )
+
+            learned_engine = save_training_checkpoint(
+                save_dir,
+                anime_df,
                 content_model=content_model,
                 collaborative_model=collaborative_model,
                 implicit_model=implicit_model,
                 popularity_model=popularity_model,
-                anime_df=anime_df,
-                train_ratings_df=train_ratings_df,
-                test_ratings_df=test_ratings_df,
-                all_ratings_df=ratings_df,
-                save_dir=save_dir,
-                min_ratings_to_train=args.learned_hybrid_min_ratings,
-                top_users=args.learned_hybrid_top_users,
-                relevance_threshold=args.relevance_threshold,
+                reason="popularity model",
             )
         else:
-            learned_engine = train_learned_hybrid_from_csv(
+            logger.info("Loading existing base models for hybrid-only stage...")
+            learned_engine = load_existing_models_for_hybrid(save_dir)
+            content_model = learned_engine.content_model
+            collaborative_model = learned_engine.collaborative_model
+            implicit_model = learned_engine.implicit_model
+            popularity_model = learned_engine.popularity_model
+
+            if matrix_dir.exists():
+                matrix_builder = MatrixBuilder()
+                matrix_builder.load(matrix_dir)
+                matrices_saved = True
+            else:
+                logger.warning(
+                    "Saved matrices not found in %s. Quick test may be skipped.",
+                    matrix_dir,
+                )
+
+        if train_hybrid_stage:
+            logger.info("=" * 50)
+            logger.info("Training Learned Hybrid Engine (meta-model)")
+            logger.info("=" * 50)
+
+            if use_sample:
+                test_ratings_df = extract_holdout_ratings_df(
+                    ratings_df,
+                    split_artifact.user_test,
+                )
+
+                learned_engine = train_learned_hybrid(
+                    content_model=content_model,
+                    collaborative_model=collaborative_model,
+                    implicit_model=implicit_model,
+                    popularity_model=popularity_model,
+                    anime_df=anime_df,
+                    train_ratings_df=train_ratings_df,
+                    test_ratings_df=test_ratings_df,
+                    all_ratings_df=ratings_df,
+                    save_dir=save_dir,
+                    min_ratings_to_train=args.learned_hybrid_min_ratings,
+                    top_users=args.learned_hybrid_top_users,
+                    relevance_threshold=args.relevance_threshold,
+                )
+            else:
+                learned_engine = train_learned_hybrid_from_csv(
+                    content_model=content_model,
+                    collaborative_model=collaborative_model,
+                    implicit_model=implicit_model,
+                    popularity_model=popularity_model,
+                    anime_df=anime_df,
+                    train_ratings_csv_path=disk_split.train_ratings_path,
+                    test_ratings_csv_path=disk_split.test_ratings_path,
+                    all_ratings_csv_path=all_ratings_csv_path,
+                    save_dir=save_dir,
+                    min_ratings_to_train=args.learned_hybrid_min_ratings,
+                    top_users=args.learned_hybrid_top_users,
+                    relevance_threshold=args.relevance_threshold,
+                    chunk_size=args.stream_chunk_size,
+                )
+
+            fi = learned_engine.get_feature_importance()
+            if fi:
+                logger.info("Feature importance (meta-model):")
+                for name, val in sorted(fi.items(), key=lambda x: -x[1]):
+                    logger.info(f"  {name:<30s} {val:.4f}  {'█' * int(val * 40)}")
+        elif learned_engine is None:
+            learned_engine = save_training_checkpoint(
+                save_dir,
+                anime_df,
                 content_model=content_model,
                 collaborative_model=collaborative_model,
                 implicit_model=implicit_model,
                 popularity_model=popularity_model,
-                anime_df=anime_df,
-                train_ratings_csv_path=disk_split.train_ratings_path,
-                test_ratings_csv_path=disk_split.test_ratings_path,
-                all_ratings_csv_path=all_ratings_csv_path,
-                save_dir=save_dir,
-                min_ratings_to_train=args.learned_hybrid_min_ratings,
-                top_users=args.learned_hybrid_top_users,
-                relevance_threshold=args.relevance_threshold,
-                chunk_size=args.stream_chunk_size,
+                reason="base stage completion",
             )
 
-        fi = learned_engine.get_feature_importance()
-        if fi:
-            logger.info("Feature importance (meta-model):")
-            for name, val in sorted(fi.items(), key=lambda x: -x[1]):
-                logger.info(f"  {name:<30s} {val:.4f}  {'█' * int(val * 40)}")
-    else:
-        # Skip meta-model: chỉ save sub-models với fallback weights
-        logger.info("Skipping meta-model training (--skip-learned-hybrid)")
-        logger.info("Saving sub-models only (fallback weighted sum sẽ được dùng)")
-        learned_engine = LearnedHybridEngine(
-            content_model=content_model,
-            collaborative_model=collaborative_model,
-            implicit_model=implicit_model,
-            popularity_model=popularity_model,
+        total_elapsed = time.time() - total_start
+        logger.info("=" * 50)
+        logger.info(
+            f"Training Complete! Total time: {total_elapsed:.2f}s ({total_elapsed/60:.1f} min)"
         )
-        learned_engine.set_anime_info(anime_df)
-        learned_engine.save(save_dir)
+        logger.info(f"Models saved to: {save_dir}")
+        logger.info("=" * 50)
 
-    # Save matrix builder cho các script khác dùng
-    matrix_builder.save(MODELS_DIR / "matrices")
+        run_quick_test(learned_engine, matrix_builder, popularity_model)
+        return learned_engine
 
-    total_elapsed = time.time() - total_start
-    logger.info("=" * 50)
-    logger.info(
-        f"Training Complete! Total time: {total_elapsed:.2f}s ({total_elapsed/60:.1f} min)"
-    )
-    logger.info(f"Models saved to: {save_dir}")
-    logger.info("=" * 50)
-
-    # ===== QUICK TEST =====
-    logger.info("\n" + "=" * 50)
-    logger.info("Quick Test")
-    logger.info("=" * 50)
-
-    test_anime = "Naruto"
-    print(f"\nRecommendations similar to '{test_anime}':")
-    recs = learned_engine.recommend_similar_anime(test_anime, top_k=5)
-    for rec in recs:
-        print(
-            f"  - {rec['name']} (Score: {rec['score']}, Hybrid: {rec['hybrid_score']:.4f})"
-        )
-
-    test_user = list(matrix_builder.user_to_idx.keys())[0]
-    test_user_ratings = matrix_builder.get_user_ratings(test_user)
-    learned_engine.set_user_history(
-        test_user,
-        ratings=test_user_ratings,
-        watched=set(test_user_ratings.keys()),
-    )
-    print(f"\nRecommendations for user {test_user}:")
-    user_recs = learned_engine.recommend_for_user(test_user, top_k=5)
-    for rec in user_recs:
-        print(
-            f"  - {rec['name']} (Hybrid: {rec['hybrid_score']:.4f}, strategy: {rec.get('strategy','?')})"
-        )
-
-    print("\nTop Rated Anime:")
-    popular = popularity_model.get_top_rated(5)
-    for p in popular:
-        print(f"  - {p['name']} (Score: {p['score']})")
-
-    return learned_engine
+    except KeyboardInterrupt:
+        logger.warning("Training interrupted by user. Saving available checkpoints...")
+        try:
+            if (
+                matrix_builder is not None
+                and matrix_builder.user_item_matrix is not None
+                and not matrices_saved
+            ):
+                matrix_builder.save(matrix_dir)
+            if any(
+                model is not None
+                for model in [
+                    content_model,
+                    collaborative_model,
+                    implicit_model,
+                    popularity_model,
+                    learned_engine,
+                ]
+            ):
+                save_training_checkpoint(
+                    save_dir,
+                    anime_df,
+                    content_model=content_model,
+                    collaborative_model=collaborative_model,
+                    implicit_model=implicit_model,
+                    popularity_model=popularity_model,
+                    learned_engine=learned_engine,
+                    reason="interrupt",
+                )
+        except Exception as checkpoint_error:
+            logger.exception("Failed to save checkpoint after interrupt: %s", checkpoint_error)
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":
