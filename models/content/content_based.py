@@ -170,11 +170,18 @@ class ContentBasedRecommender:
         if idx is None:
             return []
 
+        n_total = len(self.embeddings)
+        # Clamp top_k: không thể trả nhiều hơn số anime trong dataset (trừ self)
+        top_k = min(top_k, n_total - 1)
+        if top_k <= 0:
+            return []
+
         query = self.embeddings[idx].reshape(1, -1)  # (1, D)
 
         if self._faiss_index is not None:
             # Lấy top_k+1 để có buffer filter self
-            scores, indices = self._faiss_index.search(query, top_k + 1)
+            fetch_k = min(top_k + 1, n_total)
+            scores, indices = self._faiss_index.search(query, fetch_k)
             scores, indices = scores[0], indices[0]
 
             results = []
@@ -199,11 +206,14 @@ class ContentBasedRecommender:
             sims = np.maximum(sims, 0)
             sims[idx] = -1
 
+            # top_k đã clamp nên argpartition không bao giờ out-of-bounds
             top_indices = np.argpartition(-sims, top_k)[:top_k]
             top_indices = top_indices[np.argsort(-sims[top_indices])]
 
             results = []
             for i in top_indices:
+                if sims[i] < 0:  # skip self (sims[idx] = -1)
+                    continue
                 row = self.anime_df.iloc[i]
                 results.append(
                     {
@@ -415,6 +425,45 @@ class ContentBasedRecommender:
         raw = f"{sorted(user_ratings.items())}|{pos_pct}|{neg_pct}|{neg_weight}"
         return hashlib.md5(raw.encode()).hexdigest()
 
+    def search_anime(self, query: str, top_k: int = 10) -> List[Dict]:
+        """
+        Tìm kiếm anime theo tên (partial match, case-insensitive).
+
+        Parameters
+        ----------
+        query  : chuỗi tìm kiếm
+        top_k  : số kết quả tối đa
+
+        Returns
+        -------
+        List[Dict]: mal_id, name, score, genres, type, episodes, synopsis
+        """
+        if self.anime_df is None:
+            return []
+
+        q = query.lower()
+        mask = self.anime_df["Name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+
+        # Thêm English name nếu có
+        if "English name" in self.anime_df.columns:
+            mask |= self.anime_df["English name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+
+        matches = self.anime_df[mask].head(top_k)
+
+        results = []
+        for i, row in matches.iterrows():
+            results.append({
+                "mal_id": int(row["MAL_ID"]),
+                "name": str(row["Name"]),
+                "score": self._score_cache.get(i, 0.0),
+                "genres": str(row["Genres"]) if "Genres" in row and pd.notna(row.get("Genres")) else None,
+                "type": str(row["Type"]) if "Type" in row and pd.notna(row.get("Type")) else None,
+                "episodes": int(row["Episodes"]) if "Episodes" in row and str(row.get("Episodes", "")).isdigit() else None,
+                "synopsis": str(row["Synopsis"]) if "Synopsis" in row and pd.notna(row.get("Synopsis")) else None,
+                "english_name": str(row["English name"]) if "English name" in row and pd.notna(row.get("English name")) else None,
+            })
+        return results
+
     def _get_idx(self, identifier):
         if isinstance(identifier, (int, np.integer)):
             return self._id_to_idx.get(int(identifier))
@@ -448,10 +497,47 @@ class ContentBasedRecommender:
             pickle.dump(state, f)
 
     def load(self, path):
+        logger.info(f"Loading ContentBasedRecommender from {path}")
         with open(path, "rb") as f:
-            self.__dict__.update(pickle.load(f))
+            state = pickle.load(f)
+
+        logger.info(f"  pkl keys: {list(state.keys())}")
+        self.__dict__.update(state)
         self._user_vector_cache = {}
         self._faiss_index = None
+
+        # Tương thích pkl cũ: map tên attribute cũ → mới
+        _compat_map = {
+            "sbert_embeddings": "embeddings",
+            "id_to_idx":        "_id_to_idx",
+            "idx_to_id":        "_idx_to_id",
+            "name_to_idx":      "_name_to_idx",
+        }
+        migrated = []
+        for old_key, new_key in _compat_map.items():
+            if old_key in state:
+                setattr(self, new_key, state[old_key])
+                migrated.append(f"{old_key}→{new_key}")
+        if migrated:
+            logger.warning(f"  old pkl format — migrated: {migrated}")
+
+        # Log trạng thái sau khi load + migrate
+        n_anime = len(self.anime_df) if self.anime_df is not None else 0
+        emb_shape = self.embeddings.shape if self.embeddings is not None else None
+        logger.info(f"  anime_df: {n_anime} rows")
+        logger.info(f"  embeddings: {emb_shape}")
+        logger.info(f"  _id_to_idx: {len(self._id_to_idx)} entries")
+        logger.info(f"  _name_to_idx: {len(self._name_to_idx)} entries")
+        logger.info(f"  _score_cache: {len(self._score_cache)} entries")
+
+        # Rebuild score_cache nếu trống
+        if not self._score_cache and self.anime_df is not None:
+            logger.info("  rebuilding _score_cache from anime_df")
+            for i, row in self.anime_df.iterrows():
+                self._score_cache[i] = self._parse_score(row.get("Score", 0))
+
         # Rebuild FAISS từ embeddings đã load — không cần train lại
         self._build_faiss_index()
+
+        logger.info(f"ContentBasedRecommender ready | {len(self._id_to_idx)} anime indexed | embeddings={emb_shape}")
         return self

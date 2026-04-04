@@ -704,10 +704,14 @@ def main():
             )
 
             if not args.skip_implicit:
+                # Dùng implicit_anime_to_idx (superset của anime_to_idx) để implicit model
+                # bao gồm cả anime ít explicit rating như One Piece (đang phát sóng)
+                implicit_anime_to_idx = getattr(matrix_builder, "implicit_anime_to_idx", matrix_builder.anime_to_idx)
+                implicit_idx_to_anime = getattr(matrix_builder, "implicit_idx_to_anime", matrix_builder.idx_to_anime)
                 implicit_model = train_implicit_model(
                     matrix_builder.implicit_matrix,
-                    matrix_builder.anime_to_idx,
-                    matrix_builder.idx_to_anime,
+                    implicit_anime_to_idx,
+                    implicit_idx_to_anime,
                     matrix_builder.user_to_idx,
                     matrix_builder.idx_to_user,
                     device=device,

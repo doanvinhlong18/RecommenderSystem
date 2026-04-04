@@ -282,6 +282,7 @@ class MatrixBuilder:
         animelist_df: pd.DataFrame,
         watching_status_df: Optional[pd.DataFrame] = None,
         chunk_size: int = 2_000_000,
+        min_implicit_anime_interactions: int = 50,
     ) -> csr_matrix:
         """
         Build implicit feedback matrix from watch data.
@@ -289,6 +290,10 @@ class MatrixBuilder:
         Converts watching status and episodes watched into confidence scores.
         Processes the animelist in chunks so it never allocates a full copy
         of the 100M+ row DataFrame in memory.
+
+        Anime với >= min_implicit_anime_interactions watch entries sẽ được thêm vào
+        implicit_anime_to_idx ngay cả khi chúng không có đủ explicit ratings
+        (ví dụ One Piece — đang phát sóng).
 
         Args:
             animelist_df: DataFrame with user_id, anime_id,
@@ -302,7 +307,28 @@ class MatrixBuilder:
         logger.info(f"Building implicit matrix from {len(animelist_df):,} records...")
 
         user_set = set(self.user_to_idx.keys()) if self.user_to_idx else None
-        anime_set = set(self.anime_to_idx.keys()) if self.anime_to_idx else None
+        explicit_anime_set = set(self.anime_to_idx.keys()) if self.anime_to_idx else set()
+
+        # Đếm implicit interactions per anime để mở rộng anime set
+        implicit_anime_counts: Dict[int, int] = defaultdict(int)
+        filtered = animelist_df if user_set is None else animelist_df[animelist_df["user_id"].isin(user_set)]
+        for aid, cnt in filtered["anime_id"].value_counts(sort=False).items():
+            implicit_anime_counts[int(aid)] += int(cnt)
+
+        implicit_only = {
+            aid
+            for aid, cnt in implicit_anime_counts.items()
+            if cnt >= min_implicit_anime_interactions and aid not in explicit_anime_set
+        }
+        logger.info(
+            "Implicit-only anime additions: %d (threshold=%d)",
+            len(implicit_only), min_implicit_anime_interactions,
+        )
+
+        all_implicit_anime = sorted(explicit_anime_set | implicit_only)
+        self.implicit_anime_to_idx: Dict[int, int] = {aid: i for i, aid in enumerate(all_implicit_anime)}
+        self.implicit_idx_to_anime: Dict[int, int] = {i: aid for aid, i in self.implicit_anime_to_idx.items()}
+        anime_set = set(self.implicit_anime_to_idx.keys())
 
         # Status weights: 1=watching, 2=completed, 3=on-hold, 4=dropped, 6=plan-to-watch
         status_weights = {
@@ -345,7 +371,7 @@ class MatrixBuilder:
             scores = (status_w * 0.6 + episode_w * 0.4).astype(np.float32)
 
             rows = chunk['user_id'].map(self.user_to_idx).values
-            cols = chunk['anime_id'].map(self.anime_to_idx).values
+            cols = chunk['anime_id'].map(self.implicit_anime_to_idx).values
 
             # Drop any unmapped rows (NaN from map — happens when mappings absent)
             valid = ~(pd.isnull(rows) | pd.isnull(cols))
@@ -364,15 +390,11 @@ class MatrixBuilder:
                     f"(rows {start:,}–{end:,})"
                 )
 
-        # --- Build mappings if not already set (no rating matrix built first) ---
+        # --- Build user mappings if not already set ---
         if not self.user_to_idx:
             unique_users = animelist_df['user_id'].unique()
             self.user_to_idx = {int(u): i for i, u in enumerate(unique_users)}
             self.idx_to_user = {i: int(u) for u, i in self.user_to_idx.items()}
-        if not self.anime_to_idx:
-            unique_anime = animelist_df['anime_id'].unique()
-            self.anime_to_idx = {int(a): i for i, a in enumerate(unique_anime)}
-            self.idx_to_anime = {i: int(a) for a, i in self.anime_to_idx.items()}
 
         # --- Concatenate and build sparse matrix ---
         logger.info("Concatenating chunks and building sparse matrix...")
@@ -383,14 +405,14 @@ class MatrixBuilder:
         del all_rows, all_cols, all_scores  # Free list RAM
 
         n_users = len(self.user_to_idx)
-        n_items = len(self.anime_to_idx)
+        n_items = len(self.implicit_anime_to_idx)
 
         self.implicit_matrix = csr_matrix(
             (all_scores_np, (all_rows_np, all_cols_np)),
             shape=(n_users, n_items),
         )
 
-        logger.info(f"Implicit matrix built: {self.implicit_matrix.nnz:,} entries")
+        logger.info(f"Implicit matrix built: {self.implicit_matrix.nnz:,} entries ({n_items} items)")
         return self.implicit_matrix
 
     def build_implicit_matrix_from_csv(
@@ -398,20 +420,66 @@ class MatrixBuilder:
         filepath: Union[str, Path],
         watching_status_df: Optional[pd.DataFrame] = None,
         chunk_size: int = 500_000,
+        min_implicit_anime_interactions: int = 50,
     ) -> csr_matrix:
         """
         Build the implicit matrix directly from a filtered animelist CSV.
+
+        Khác với bản gốc: anime_set KHÔNG còn bị ràng buộc bởi explicit anime_to_idx.
+        Anime có đủ implicit interactions (>= min_implicit_anime_interactions) sẽ được
+        thêm vào implicit_anime_to_idx, kể cả khi chúng vắng trong explicit ratings
+        (ví dụ: One Piece — đang phát sóng, ít explicit rating nhưng 130K+ watch entries).
+
+        Sau khi build, self.implicit_anime_to_idx / implicit_idx_to_anime chứa mapping
+        cho implicit matrix. self.anime_to_idx không bị thay đổi (vẫn dùng cho CF).
         """
         filepath = Path(filepath)
         logger.info("Building implicit matrix from CSV: %s", filepath)
 
-        if not self.user_to_idx or not self.anime_to_idx:
+        if not self.user_to_idx:
             raise ValueError(
-                "Explicit rating mappings must be built before reading implicit CSV data."
+                "Explicit rating mappings (user_to_idx) must be built before reading implicit CSV data."
             )
 
         user_set = set(self.user_to_idx.keys())
-        anime_set = set(self.anime_to_idx.keys())
+
+        # --- Pass 1: đếm implicit interactions per anime ---
+        logger.info("  Pass 1: counting implicit interactions per anime...")
+        implicit_anime_counts: Dict[int, int] = defaultdict(int)
+        for chunk in pd.read_csv(
+            filepath,
+            chunksize=chunk_size,
+            usecols=["user_id", "anime_id"],
+            dtype={"user_id": "int32", "anime_id": "int32"},
+        ):
+            chunk = chunk[chunk["user_id"].isin(user_set)]
+            if chunk.empty:
+                continue
+            for aid, cnt in chunk["anime_id"].value_counts(sort=False).items():
+                implicit_anime_counts[int(aid)] += int(cnt)
+
+        # Union: explicit anime + anime có đủ implicit interactions
+        explicit_anime_set = set(self.anime_to_idx.keys())
+        implicit_only = {
+            aid
+            for aid, cnt in implicit_anime_counts.items()
+            if cnt >= min_implicit_anime_interactions and aid not in explicit_anime_set
+        }
+        logger.info(
+            "  Explicit anime: %d | Implicit-only additions: %d (threshold=%d)",
+            len(explicit_anime_set),
+            len(implicit_only),
+            min_implicit_anime_interactions,
+        )
+
+        # Build implicit-specific mappings (superset của explicit)
+        all_implicit_anime = sorted(explicit_anime_set | implicit_only)
+        self.implicit_anime_to_idx: Dict[int, int] = {aid: i for i, aid in enumerate(all_implicit_anime)}
+        self.implicit_idx_to_anime: Dict[int, int] = {i: aid for aid, i in self.implicit_anime_to_idx.items()}
+        n_implicit_items = len(self.implicit_anime_to_idx)
+        logger.info("  Implicit matrix will have %d items", n_implicit_items)
+
+        anime_set = set(self.implicit_anime_to_idx.keys())
 
         status_weights = {
             1: 0.8,
@@ -425,6 +493,8 @@ class MatrixBuilder:
         col_parts = []
         score_parts = []
 
+        # --- Pass 2: materialize scores ---
+        logger.info("  Pass 2: materializing implicit scores...")
         for chunk_idx, chunk in enumerate(
             pd.read_csv(
                 filepath,
@@ -450,7 +520,7 @@ class MatrixBuilder:
                 chunk["user_id"].map(self.user_to_idx).to_numpy(dtype=np.int32, copy=False)
             )
             col_parts.append(
-                chunk["anime_id"].map(self.anime_to_idx).to_numpy(dtype=np.int32, copy=False)
+                chunk["anime_id"].map(self.implicit_anime_to_idx).to_numpy(dtype=np.int32, copy=False)
             )
             score_parts.append(
                 scores.to_numpy(dtype=np.float32, copy=False)
@@ -461,7 +531,7 @@ class MatrixBuilder:
 
         if not score_parts:
             self.implicit_matrix = csr_matrix(
-                (self.n_users, self.n_items),
+                (self.n_users, n_implicit_items),
                 dtype=np.float32,
             )
             logger.info("Implicit matrix built: 0 entries")
@@ -473,10 +543,10 @@ class MatrixBuilder:
 
         self.implicit_matrix = csr_matrix(
             (scores, (row_indices, col_indices)),
-            shape=(self.n_users, self.n_items),
+            shape=(self.n_users, n_implicit_items),
         )
 
-        logger.info(f"Implicit matrix built: {self.implicit_matrix.nnz:,} entries")
+        logger.info(f"Implicit matrix built: {self.implicit_matrix.nnz:,} entries ({n_implicit_items} items)")
         return self.implicit_matrix
 
     # ------------------------------------------------------------------

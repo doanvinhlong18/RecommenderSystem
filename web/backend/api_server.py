@@ -327,8 +327,8 @@ def create_demo_app() -> FastAPI:
         if hybrid_engine is None:
             raise HTTPException(status_code=503, detail="Model not loaded")
 
-        anime_info = hybrid_engine._anime_info.get(anime_id)
-        if anime_info is None:
+        anime_info = hybrid_engine._get_anime_info(anime_id)
+        if not anime_info or anime_info.get("name", "").startswith(f"Anime {anime_id}"):
             raise HTTPException(
                 status_code=404, detail=f"Anime with ID {anime_id} not found"
             )
@@ -436,9 +436,9 @@ def create_demo_app() -> FastAPI:
             raise HTTPException(status_code=503, detail="Model not loaded")
 
         try:
-            # Get query anime info
-            query_anime = hybrid_engine._anime_info.get(anime_id)
-            if query_anime is None:
+            # Get query anime info (fallback to content model if not in _anime_info)
+            query_anime = hybrid_engine._get_anime_info(anime_id)
+            if not query_anime or (query_anime.get("name", "").startswith(f"Anime {anime_id}") and not hybrid_engine._anime_info.get(anime_id)):
                 raise HTTPException(
                     status_code=404, detail=f"Anime ID {anime_id} not found"
                 )
@@ -449,6 +449,16 @@ def create_demo_app() -> FastAPI:
             recommendations = hybrid_engine.recommend_similar_anime(
                 anime_id, top_k=top_k, method=method
             )
+            logger.info(f"recommend_similar_anime({anime_id}, method={method}) → {len(recommendations)} results")
+
+            # Check content model index
+            if len(recommendations) == 0 and method == "content":
+                cm = hybrid_engine.content_model
+                in_idx = cm is not None and anime_id in getattr(cm, "_id_to_idx", {})
+                logger.warning(f"  content_model._id_to_idx has id={anime_id}: {in_idx}, n_total={len(getattr(cm, '_id_to_idx', {}))}")
+                if cm is not None:
+                    sample = list(getattr(cm, "_id_to_idx", {}).keys())[:5]
+                    logger.warning(f"  sample _id_to_idx keys: {sample}")
 
             # Enrich with images
             enriched_recs = []
