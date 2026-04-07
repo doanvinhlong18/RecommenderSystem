@@ -30,10 +30,13 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+    nn = None
     logger.warning("PyTorch not available. GPU acceleration disabled for MatrixFactorization.")
 
+_BaseModule = nn.Module if TORCH_AVAILABLE else object
 
-class TorchMatrixFactorization(nn.Module):
+
+class TorchMatrixFactorization(_BaseModule):
     """PyTorch-based Matrix Factorization for GPU training."""
 
     def __init__(self, n_users: int, n_items: int, n_factors: int):

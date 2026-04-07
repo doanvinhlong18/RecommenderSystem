@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Anime Recommendation System - Web Demo</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20260408-1">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>A</text></svg>">
 </head>
@@ -111,6 +111,9 @@
                             <button class="method-btn" data-method="collaborative" title="Collaborative Filtering">
                                 Collaborative
                             </button>
+                            <button class="method-btn" data-method="implicit" title="Implicit Feedback (ALS)">
+                                Implicit
+                            </button>
                             <button class="method-btn active" data-method="hybrid" title="Hybrid (Combined)">
                                 Hybrid
                             </button>
@@ -200,7 +203,7 @@
                                 class="user-id-input"
                                 id="userIdInput"
                                 placeholder="e.g., 12345"
-                                min="1"
+                                min="0"
                             >
                             <button class="get-user-recs-btn" id="getUserRecsBtn">
                                 Get Recommendations
@@ -209,9 +212,10 @@
                         <!-- Demo User IDs -->
                         <div class="demo-users">
                             <span class="demo-label">Try demo users:</span>
-                            <button class="demo-user-btn" data-user="1">User 1</button>
-                            <button class="demo-user-btn" data-user="100">User 100</button>
-                            <button class="demo-user-btn" data-user="999999">New User (Cold Start)</button>
+                            <div id="demoUserBtns">
+                                <!-- Populated dynamically from /api/demo/users -->
+                                <div class="spinner small"></div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -269,6 +273,13 @@
                         </div>
                         <div class="column-content" id="collaborativeResults"></div>
                     </div>
+<!--                    <div class="comparison-column" id="implicitColumn">-->
+<!--                        <div class="column-header implicit-header">-->
+<!--                            <h3>Implicit</h3>-->
+<!--                            <p>ALS interaction mining</p>-->
+<!--                        </div>-->
+<!--                        <div class="column-content" id="implicitResults"></div>-->
+<!--                    </div>-->
                     <div class="comparison-column" id="hybridColumn">
                         <div class="column-header hybrid-header">
                             <h3>Hybrid</h3>
@@ -331,6 +342,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="/static/app.js?v=20260408-1"></script>
 </body>
 </html>
