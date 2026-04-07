@@ -706,7 +706,7 @@ class LearnedHybridEngine:
         collab_candidates: Dict[int, float] = {}
         query_anime_id = self._resolve_anime_id(anime_identifier)
 
-        if self.implicit_model and method == "hybrid" and query_anime_id:
+        if self.implicit_model and method in ("implicit", "hybrid") and query_anime_id:
             try:
                 recs = self.implicit_model.get_similar_items(
                     query_anime_id, top_k=top_k * 3
@@ -746,22 +746,27 @@ class LearnedHybridEngine:
         w = self.fallback_weights
         aggregated = []
         for aid, sources in all_candidates.items():
-            score = (
-                w["content"] * sources.get("content", 0.0)
-                + w["collaborative"] * sources.get("collaborative", 0.0)
-                + w["implicit"] * sources.get("implicit", 0.0)
-            )
-            # Confidence boost: xuất hiện ở nhiều model → score cao hơn
-            n_src = len(sources)
-            if n_src >= 2:
-                score *= 1.0 + 0.15 * (n_src - 1)
-            aggregated.append(
-                {
-                    "mal_id": aid,
-                    "hybrid_score": score,
-                    "sources": list(sources.keys()),
-                }
-            )
+            if method == "hybrid":
+                score = (
+                    w["content"] * sources.get("content", 0.0)
+                    + w["collaborative"] * sources.get("collaborative", 0.0)
+                    + w["implicit"] * sources.get("implicit", 0.0)
+                )
+                # Confidence boost: xuất hiện ở nhiều model → score cao hơn
+                n_src = len(sources)
+                if n_src >= 2:
+                    score *= 1.0 + 0.15 * (n_src - 1)
+            else:
+                score = sources.get(method, 0.0)
+                
+            if score > 0:
+                aggregated.append(
+                    {
+                        "mal_id": int(aid),
+                        "hybrid_score": score,
+                        "sources": list(sources.keys()),
+                    }
+                )
         aggregated.sort(key=lambda x: -x["hybrid_score"])
 
         # ── Stage 4: Enrich + Genre MMR ──────────────────────────────

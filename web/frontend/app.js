@@ -25,7 +25,9 @@ const state = {
         images: {}  // Cache for anime images
     },
     imageQueue: [],  // Queue for fetching images
-    isFetchingImages: false
+    isFetchingImages: false,
+    historyChart: null,
+    recsChart: null,
 };
 
 // =============================================================================
@@ -60,7 +62,7 @@ const elements = {
     // User Page
     userIdInput: document.getElementById('userIdInput'),
     getUserRecsBtn: document.getElementById('getUserRecsBtn'),
-    demoUserBtns: document.querySelectorAll('.demo-user-btn'),
+    demoUserBtnsContainer: document.getElementById('demoUserBtns'),
     userStrategyInfo: document.getElementById('userStrategyInfo'),
     strategyBadge: document.getElementById('strategyBadge'),
     coldStartNotice: document.getElementById('coldStartNotice'),
@@ -73,6 +75,7 @@ const elements = {
     comparisonGrid: document.getElementById('comparisonGrid'),
     contentResults: document.getElementById('contentResults'),
     collaborativeResults: document.getElementById('collaborativeResults'),
+    implicitResults: document.getElementById('implicitResults'),
     hybridResults: document.getElementById('hybridResults'),
 
     // Weights
@@ -95,8 +98,13 @@ const elements = {
 // =============================================================================
 
 async function apiRequest(endpoint, options = {}) {
+    const timeoutMs = options._timeout ?? 20000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
         const response = await fetch(`${API_BASE}${endpoint}`, {
+            signal: controller.signal,
             headers: {
                 'Content-Type': 'application/json',
                 ...options.headers
@@ -111,8 +119,13 @@ async function apiRequest(endpoint, options = {}) {
 
         return await response.json();
     } catch (error) {
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timed out (${timeoutMs / 1000}s): ${endpoint}`);
+        }
         console.error(`API Error (${endpoint}):`, error);
         throw error;
+    } finally {
+        clearTimeout(timer);
     }
 }
 
@@ -286,8 +299,8 @@ async function fetchAnimeImageFromJikan(malId) {
         }
         const data = await response.json();
         const imageUrl = data.data?.images?.jpg?.large_image_url ||
-                        data.data?.images?.jpg?.image_url ||
-                        PLACEHOLDER_IMAGE;
+            data.data?.images?.jpg?.image_url ||
+            PLACEHOLDER_IMAGE;
 
         // Cache the result
         state.cache.images[malId] = imageUrl;
@@ -440,7 +453,7 @@ async function renderSelectedAnime(anime) {
     const imgElement = document.getElementById('selectedAnimeImage');
     imgElement.src = imageUrl;
     imgElement.dataset.malId = anime.mal_id;
-    imgElement.onerror = function() { handleImageError(this); };
+    imgElement.onerror = function () { handleImageError(this); };
 
     document.getElementById('selectedAnimeName').textContent = anime.name;
     document.getElementById('selectedAnimeEnglish').textContent = anime.english_name || anime.name;
@@ -493,17 +506,25 @@ function renderPopularGrid(animeList) {
 }
 
 function renderUserRecommendations(data) {
-    // Update strategy info
-    elements.userStrategyInfo.classList.remove('hidden');
-    elements.strategyBadge.querySelector('.strategy-text').textContent = `Strategy: ${data.strategy}`;
+    // Be defensive if some DOM nodes aren't present in this HTML version
+    if (elements.userStrategyInfo) {
+        elements.userStrategyInfo.classList.remove('hidden');
+    }
+    if (elements.strategyBadge) {
+        const textEl = elements.strategyBadge.querySelector('.strategy-text');
+        if (textEl) textEl.textContent = `Strategy: ${data.strategy}`;
+    }
 
-    if (data.is_cold_start) {
-        elements.coldStartNotice.classList.remove('hidden');
-    } else {
-        elements.coldStartNotice.classList.add('hidden');
+    if (elements.coldStartNotice) {
+        if (data.is_cold_start) {
+            elements.coldStartNotice.classList.remove('hidden');
+        } else {
+            elements.coldStartNotice.classList.add('hidden');
+        }
     }
 
     // Render grid
+    if (!elements.userRecsGrid) return;
     if (!data.recommendations || data.recommendations.length === 0) {
         elements.userRecsGrid.innerHTML = '<p class="no-results">No recommendations found.</p>';
         return;
@@ -511,13 +532,26 @@ function renderUserRecommendations(data) {
 
     const html = data.recommendations.map((anime, idx) => renderAnimeCard(anime, idx + 1)).join('');
     elements.userRecsGrid.innerHTML = html;
+
+    renderRecsChart(data.recommendations || []);
 }
 
 function renderCompareItem(anime) {
     const imageUrl = getImageUrl(anime);
     const score = anime.score ? anime.score.toFixed(1) : 'N/A';
-    const similarity = anime.similarity ? (anime.similarity * 100).toFixed(0) :
-                       anime.hybrid_score ? (anime.hybrid_score * 100).toFixed(0) : 'N/A';
+
+    // Similarity from models is often very close to 1.0 (e.g., 0.9992). If we round to 0 decimals,
+    // everything becomes "100%". Use 1 decimal + clamp to keep it meaningful.
+    let matchVal = null;
+    if (anime.similarity != null) {
+        matchVal = Number(anime.similarity) * 100;
+    } else if (anime.hybrid_score != null) {
+        matchVal = Number(anime.hybrid_score) * 100;
+    }
+
+    const matchText = (matchVal == null || Number.isNaN(matchVal))
+        ? 'N/A'
+        : Math.max(0, Math.min(100, matchVal)).toFixed(1);
 
     // Queue image fetch
     if (!state.cache.images[anime.mal_id]) {
@@ -529,7 +563,7 @@ function renderCompareItem(anime) {
             <img src="${imageUrl}" alt="${anime.name}" data-mal-id="${anime.mal_id}" onerror="handleImageError(this)">
             <div class="compare-item-info">
                 <div class="compare-item-name">${anime.name}</div>
-                <div class="compare-item-score">${score} | ${similarity}% match</div>
+                <div class="compare-item-score">${score} | ${matchText}% match</div>
             </div>
         </div>
     `;
@@ -552,11 +586,22 @@ function renderComparison(results) {
         elements.collaborativeResults.innerHTML = '<p class="no-results">No results</p>';
     }
 
+    // Implicit results
+    if (elements.implicitResults) {
+        if (results.implicit && results.implicit.length > 0) {
+            elements.implicitResults.innerHTML = results.implicit.map(renderCompareItem).join('');
+        } else {
+            elements.implicitResults.innerHTML = '<p class="no-results">No results</p>';
+        }
+    }
+
     // Hybrid results
-    if (results.hybrid && results.hybrid.length > 0) {
-        elements.hybridResults.innerHTML = results.hybrid.map(renderCompareItem).join('');
-    } else {
-        elements.hybridResults.innerHTML = '<p class="no-results">No results</p>';
+    if (elements.hybridResults) {
+        if (results.hybrid && results.hybrid.length > 0) {
+            elements.hybridResults.innerHTML = results.hybrid.map(renderCompareItem).join('');
+        } else {
+            elements.hybridResults.innerHTML = '<p class="no-results">No results</p>';
+        }
     }
 }
 
@@ -705,17 +750,361 @@ async function loadGenres() {
     }
 }
 
-async function handleUserRecommendations() {
-    const userId = parseInt(elements.userIdInput.value);
-    if (!userId || userId < 1) {
-        showToast('Please enter a valid user ID', 'warning');
+async function loadDemoUsers() {
+    const fallbackUsers = [
+        { user_id: 1, label: 'User 1', description: 'Demo user' },
+        { user_id: 100, label: 'User 100', description: 'Demo user' },
+        { user_id: 999999, label: 'New User', description: 'Cold start' },
+    ];
+
+    const renderDemoButtons = (users) => {
+        const container = elements.demoUserBtnsContainer;
+        container.innerHTML = users.map(u => `
+            <button class="demo-user-btn" data-user="${u.user_id}" title="${u.description}">${u.label}</button>
+        `).join('');
+        container.querySelectorAll('.demo-user-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                elements.userIdInput.value = btn.dataset.user;
+                handleUserRecommendations();
+            });
+        });
+    };
+
+    try {
+        const data = await apiRequest('/api/demo/users', { _timeout: 8000 });
+        renderDemoButtons(data.users || fallbackUsers);
+    } catch (e) {
+        console.warn('Demo users API failed, using fallback:', e.message);
+        renderDemoButtons(fallbackUsers);
+    }
+}
+
+async function loadUserHistory(userId) {
+    const section = document.getElementById('userHistorySection');
+    if (section) section.classList.add('hidden');
+
+    // Frontend guard: when the page loads or input is empty, userId can be 0/''.
+    // Don't call the backend in that case (it can scan large CSVs in older builds).
+    const uid = Number(userId);
+    if (!Number.isFinite(uid) || uid <= 0) {
+        const cComp = document.getElementById('countCompleted'); if (cComp) cComp.textContent = '0';
+        const cWatch = document.getElementById('countWatching'); if (cWatch) cWatch.textContent = '0';
+        const cHold = document.getElementById('countOnhold'); if (cHold) cHold.textContent = '0';
+        const cDrop = document.getElementById('countDropped'); if (cDrop) cDrop.textContent = '0';
+        const hStats = document.getElementById('historyStats'); if (hStats) hStats.textContent = '0 anime in history';
+        const hGrid = document.getElementById('historyGrid');
+        if (hGrid) hGrid.innerHTML = '<p class="no-results">Select a demo user to see watch history.</p>';
+        return null;
+    }
+
+    let data;
+    try {
+        // History is a nice-to-have; keep it snappy so it doesn't block recommendations.
+        data = await apiRequest(`/api/user/${uid}/history?top_k=20`, { _timeout: 8000 });
+    } catch (e) {
+        console.warn('History fetch failed:', e);
+        return null;
+    }
+
+    // If there's no history, keep the section hidden but reset counters.
+    if (!data.is_known_user || !data.history || data.history.length === 0) {
+        const cComp = document.getElementById('countCompleted'); if(cComp) cComp.textContent = '0';
+        const cWatch = document.getElementById('countWatching'); if(cWatch) cWatch.textContent = '0';
+        const cHold = document.getElementById('countOnhold'); if(cHold) cHold.textContent = '0';
+        const cDrop = document.getElementById('countDropped'); if(cDrop) cDrop.textContent = '0';
+        const hStats = document.getElementById('historyStats'); if(hStats) hStats.textContent = '0 anime in history';
+        const hGrid = document.getElementById('historyGrid'); if(hGrid) hGrid.innerHTML = '<p class="no-results">No watch history found for this user.</p>';
+        return null;
+    }
+
+    const completed = data.history.filter(a => a.implicit_score >= 0.55).length;
+    const dropped = data.history.filter(a => a.implicit_score < 0.15).length;
+    const onhold = data.history.filter(
+        a => a.implicit_score >= 0.15 && a.implicit_score < 0.35
+    ).length;
+    const watching = data.history.length - completed - dropped - onhold;
+
+    const cComp = document.getElementById('countCompleted'); if(cComp) cComp.textContent = completed;
+    const cWatch = document.getElementById('countWatching'); if(cWatch) cWatch.textContent = watching;
+    const cHold = document.getElementById('countOnhold'); if(cHold) cHold.textContent = onhold;
+    const cDrop = document.getElementById('countDropped'); if(cDrop) cDrop.textContent = dropped;
+    const hStats = document.getElementById('historyStats'); if(hStats) hStats.textContent =
+        `${data.count} anime in history`;
+
+    const html = data.history.map(anime => {
+        const fillPct = Math.round(anime.implicit_score * 100);
+        const name = (anime.name || 'Unknown').slice(0, 22);
+        const imgUrl = anime.image_url || PLACEHOLDER_IMAGE;
+        return `
+            <div class="history-card" title="${anime.name} — score: ${anime.implicit_score.toFixed(2)}">
+                <img
+                    src="${imgUrl}"
+                    alt="${anime.name}"
+                    data-mal-id="${anime.mal_id}"
+                    onerror="handleImageError(this)"
+                >
+                <div class="history-card-bar">
+                    <div class="history-card-fill" style="width:${fillPct}%"></div>
+                </div>
+                <span class="history-card-name">${name}</span>
+            </div>
+        `;
+    }).join('');
+
+    const hGrid = document.getElementById('historyGrid');
+    if (hGrid) {
+        hGrid.innerHTML = html;
+    }
+    if (section) section.classList.remove('hidden');
+
+    data.history.forEach(a => {
+        if (!state.cache.images[a.mal_id]) queueImageFetch(a.mal_id);
+    });
+
+    renderHistoryChart(data.history);
+
+    return data;
+}
+
+function renderHistoryChart(historyData) {
+    const section = document.getElementById('historyChartSection');
+    if (!section) return; // safeguard if element was removed from HTML
+    
+    if (!historyData || historyData.length === 0) {
+        section.classList.add('hidden');
         return;
     }
 
+    if (typeof Chart === 'undefined') {
+        section.classList.add('hidden');
+        return;
+    }
+
+    if (state.historyChart) {
+        state.historyChart.destroy();
+        state.historyChart = null;
+    }
+
+    const STATUS_ORDER = ['Completed', 'Watching', 'On-hold', 'Dropped'];
+    const STATUS_COLORS = {
+        'Completed': '#22c55e',
+        'Watching': '#3b82f6',
+        'On-hold': '#f97316',
+        'Dropped': '#ef4444',
+    };
+
+    const sorted = [...historyData].sort((a, b) => {
+        const oa = STATUS_ORDER.indexOf(a.status_label);
+        const ob = STATUS_ORDER.indexOf(b.status_label);
+        if (oa !== ob) return oa - ob;
+        return b.implicit_score - a.implicit_score;
+    });
+
+    const labels = sorted.map(a => (a.name || 'Unknown').slice(0, 28));
+    const episodes = sorted.map(a => a.watched_episodes || 0);
+    const colors = sorted.map(a => STATUS_COLORS[a.status_label] || '#64748b');
+
+    section.classList.remove('hidden');
+
+    const chartHeight = Math.max(200, sorted.length * 28 + 60);
+    const canvas = document.getElementById('historyChart');
+    canvas.style.height = chartHeight + 'px';
+
+    const ctx = canvas.getContext('2d');
+    state.historyChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [{
+                label: 'Episodes Watched',
+                data: episodes,
+                backgroundColor: colors,
+                borderRadius: 3,
+                barThickness: 18,
+            }],
+        },
+        options: {
+            responsive: true,
+            indexAxis: 'y',
+            animation: { duration: 600 },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => {
+                            const item = sorted[ctx.dataIndex];
+                            return `${item.name}: ${ctx.raw} eps (${item.status_label})`;
+                        },
+                    },
+                },
+            },
+            scales: {
+                x: {
+                    min: 0,
+                    ticks: { precision: 0, color: '#94a3b8' },
+                    grid: { color: 'rgba(255,255,255,0.05)' },
+                    title: { display: true, text: 'Episodes Watched', color: '#94a3b8' },
+                },
+                y: {
+                    grid: { display: false },
+                    ticks: { color: '#94a3b8', font: { size: 11 } },
+                },
+            },
+        },
+    });
+
+    const legendHtml = STATUS_ORDER.map(s => `
+        <span class="legend-item">
+            <span class="legend-dot" style="background:${STATUS_COLORS[s]}"></span> ${s}
+        </span>
+    `).join('');
+    document.getElementById('historyChartLegend').innerHTML = legendHtml;
+}
+
+function renderRecsChart(recommendations) {
+    const section = document.getElementById('recsChartSection');
+    if (!section) return; // safeguard if element was removed from HTML
+    
+    if (!recommendations || recommendations.length === 0) {
+        section.classList.add('hidden');
+        return;
+    }
+
+    if (typeof Chart === 'undefined') {
+        section.classList.add('hidden');
+        return;
+    }
+
+    if (state.recsChart) {
+        state.recsChart.destroy();
+        state.recsChart = null;
+    }
+
+    const recs = recommendations.slice(0, 10);
+    const maxScore = Math.max(...recs.map(r => r.hybrid_score || r.predicted_rating || 1));
+    const normalized = recs.map(r =>
+        parseFloat(((r.hybrid_score || r.predicted_rating || 0) / maxScore).toFixed(3))
+    );
+
+    const GENRE_COLORS = ['#6366f1', '#06b6d4', '#f59e0b', '#ec4899', '#10b981'];
+    const genreMap = {};
+    recs.forEach(r => {
+        const primary = r.genres ? r.genres.split(',')[0].trim() : '';
+        if (primary && !(primary in genreMap)) {
+            const colorIdx = Object.keys(genreMap).length;
+            genreMap[primary] = colorIdx < GENRE_COLORS.length
+                ? GENRE_COLORS[colorIdx]
+                : '#64748b';
+        }
+    });
+
+    const bgColors = recs.map(r => {
+        const primary = r.genres ? r.genres.split(',')[0].trim() : '';
+        return genreMap[primary] || '#64748b';
+    });
+
+    const labels = recs.map(r => (r.name || 'Unknown').slice(0, 28));
+
+    section.classList.remove('hidden');
+
+    const chartHeight = Math.max(160, recs.length * 28 + 60);
+    const canvas = document.getElementById('recsChart');
+    canvas.style.height = chartHeight + 'px';
+
+    const ctx = canvas.getContext('2d');
+    state.recsChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [{
+                label: 'Relevance Score (ALS)',
+                data: normalized,
+                backgroundColor: bgColors,
+                borderRadius: 3,
+                barThickness: 18,
+            }],
+        },
+        options: {
+            responsive: true,
+            indexAxis: 'y',
+            animation: { duration: 600 },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => {
+                            const anime = recs[ctx.dataIndex];
+                            const primary = anime.genres ? anime.genres.split(',')[0].trim() : 'Unknown';
+                            return `MAL Score: ${anime.score ?? 'N/A'} | Genre: ${primary}`;
+                        },
+                    },
+                },
+            },
+            scales: {
+                x: {
+                    min: 0,
+                    max: 1,
+                    ticks: { color: '#94a3b8' },
+                    grid: { color: 'rgba(255,255,255,0.05)' },
+                    title: { display: true, text: 'Relevance Score (ALS)', color: '#94a3b8' },
+                },
+                y: {
+                    grid: { display: false },
+                    ticks: { color: '#94a3b8', font: { size: 11 } },
+                },
+            },
+        },
+    });
+
+    const legendHtml = Object.entries(genreMap).map(([genre, color]) => `
+        <span class="legend-item">
+            <span class="legend-dot" style="background:${color}"></span> ${genre}
+        </span>
+    `).join('');
+    document.getElementById('recsChartLegend').innerHTML = legendHtml;
+}
+
+async function handleUserRecommendations() {
+    // IMPORTANT: Always clear the overlay, even if rendering throws.
     showLoading(true);
+
     try {
+        const userId = parseInt(elements.userIdInput?.value);
+        if (Number.isNaN(userId) || userId < 0) {
+            showToast('Please enter a valid user ID (>= 0)', 'warning');
+            return;
+        }
+
+        // Reset optional UI sections before loading
+        const hcSection = document.getElementById('historyChartSection');
+        if (hcSection) hcSection.classList.add('hidden');
+        const rcSection = document.getElementById('recsChartSection');
+        if (rcSection) rcSection.classList.add('hidden');
+
+        if (state.historyChart) { state.historyChart.destroy(); state.historyChart = null; }
+        if (state.recsChart) { state.recsChart.destroy(); state.recsChart = null; }
+
+        // Load history first (non-fatal if missing)
+        try {
+            const historyData = await loadUserHistory(userId);
+            if (!historyData) {
+                const section = document.getElementById('userHistorySection');
+                if (section) section.classList.remove('hidden');
+            }
+        } catch (e) {
+            // History should never block recommendations
+            console.warn('User history render failed (continuing):', e);
+        }
+
         const data = await getUserRecommendations(userId);
-        renderUserRecommendations(data);
+
+        // Render might throw if DOM is partially missing; keep it isolated.
+        try {
+            renderUserRecommendations(data);
+        } catch (e) {
+            console.error('renderUserRecommendations failed:', e);
+        }
+
         showToast(`Found ${data.count} recommendations for user ${userId}`, 'success');
     } catch (error) {
         showToast(`Failed to get recommendations: ${error.message}`, 'error');
@@ -723,6 +1112,10 @@ async function handleUserRecommendations() {
         showLoading(false);
     }
 }
+
+// =============================================================================
+// Compare Handler
+// =============================================================================
 
 async function handleCompare() {
     const query = elements.compareSearchInput.value.trim();
@@ -743,31 +1136,45 @@ async function handleCompare() {
         const anime = searchData.results[0];
         const data = await compareRecommendations(anime.mal_id);
 
-        if (data.results) {
-            renderComparison(data.results);
-            showToast('Comparison loaded', 'success');
+        // Make sure we're on the compare page and the grid is visible
+        switchPage('compare');
+        elements.comparisonGrid.classList.remove('hidden');
+
+        // Be defensive about response shape
+        const results = (data && data.results) ? data.results : null;
+        if (!results) {
+            renderComparison({ content: [], collaborative: [], implicit: [], hybrid: [] });
+            showToast('No comparison results returned', 'warning');
+            return;
         }
+
+        renderComparison(results);
+        showToast('Comparison loaded', 'success');
     } catch (error) {
-        showToast(`Comparison failed: ${error.message}`, 'error');
+        showToast(`Compare failed: ${error.message}`, 'error');
     } finally {
         showLoading(false);
     }
 }
+
+// =============================================================================
+// Weights Handler
+// =============================================================================
 
 async function handleApplyWeights() {
     const weights = {
         content: parseFloat(elements.weightContent.value) / 100,
         collaborative: parseFloat(elements.weightCollaborative.value) / 100,
         implicit: parseFloat(elements.weightImplicit.value) / 100,
-        popularity: parseFloat(elements.weightPopularity.value) / 100
+        popularity: parseFloat(elements.weightPopularity.value) / 100,
     };
 
     showLoading(true);
     try {
-        await updateWeights(weights);
-        // Clear cache since weights changed
-        state.cache.recommendations = {};
-        showToast('Weights updated successfully', 'success');
+        const data = await updateWeights(weights);
+        if (data.weights) {
+            showToast('Weights updated', 'success');
+        }
     } catch (error) {
         showToast(`Failed to update weights: ${error.message}`, 'error');
     } finally {
@@ -776,7 +1183,7 @@ async function handleApplyWeights() {
 }
 
 // =============================================================================
-// Event Listeners
+// Event Listener Initialization
 // =============================================================================
 
 function initEventListeners() {
@@ -840,14 +1247,6 @@ function initEventListeners() {
         if (e.key === 'Enter') handleUserRecommendations();
     });
 
-    // Demo users
-    elements.demoUserBtns.forEach(btn => {
-        btn.addEventListener('click', () => {
-            elements.userIdInput.value = btn.dataset.user;
-            handleUserRecommendations();
-        });
-    });
-
     // Compare
     elements.compareSearchBtn.addEventListener('click', handleCompare);
     elements.compareSearchInput.addEventListener('keypress', (e) => {
@@ -856,7 +1255,7 @@ function initEventListeners() {
 
     // Weights
     const weightSliders = [elements.weightContent, elements.weightCollaborative,
-                          elements.weightImplicit, elements.weightPopularity];
+    elements.weightImplicit, elements.weightPopularity];
     weightSliders.forEach(slider => {
         slider.addEventListener('input', () => {
             const valueEl = document.getElementById(`${slider.id}Value`);
@@ -894,19 +1293,27 @@ function debounce(func, wait) {
 // =============================================================================
 
 async function init() {
-    console.log('🎌 Anime Recommender initializing...');
+    console.log('Anime Recommender initializing...');
 
-    // Check API status
-    await checkApiStatus();
+    // Always start with overlay hidden; show it only for explicit user actions.
+    showLoading(false);
 
-    // Load genres for filter
-    await loadGenres();
-
-    // Initialize event listeners
+    // Init event listeners FIRST so UI is always interactive regardless of API state
     initEventListeners();
 
-    console.log('✅ Anime Recommender ready!');
+    try {
+        await checkApiStatus();
+    } catch (e) {
+        console.warn('API status check failed:', e.message);
+    }
+
+    // Load demo users & genres in parallel, non-blocking
+    loadDemoUsers();
+    loadGenres().catch(e => console.warn('Genres load failed:', e.message));
+
+    console.log('Anime Recommender ready!');
 }
 
 // Start app when DOM is ready
 document.addEventListener('DOMContentLoaded', init);
+

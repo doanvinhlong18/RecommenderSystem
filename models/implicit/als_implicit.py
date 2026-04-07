@@ -638,9 +638,16 @@ class ALSImplicit:
         if self._implicit_model is not None:
             try:
                 similar_items = self._implicit_model.similar_items(item_idx, N=top_k + 1)
+                # Handle new implicit lib format: returns (ids_array, scores_array)
+                if (isinstance(similar_items, tuple) and len(similar_items) == 2
+                        and hasattr(similar_items[0], '__len__')):
+                    similar_items = list(zip(similar_items[0], similar_items[1]))
                 results = []
                 for idx, score in similar_items:
+                    idx = int(idx)
                     if idx == item_idx:
+                        continue
+                    if idx not in self.idx_to_anime:
                         continue
                     results.append({
                         'mal_id': self.idx_to_anime[idx],
@@ -667,7 +674,10 @@ class ALSImplicit:
 
         results = []
         for idx in similar_indices:
+            idx = int(idx)
             if idx == item_idx:
+                continue
+            if idx not in self.idx_to_anime:
                 continue
             if len(results) >= top_k:
                 break

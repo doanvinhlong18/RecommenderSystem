@@ -337,14 +337,14 @@ class HybridEngine:
                 logger.warning(f"Collaborative similarity error: {e}")
 
         # Implicit (ALS item factors — dùng implicit library's FAISS internally)
-        if self.implicit_model and method == "hybrid":
+        if self.implicit_model and method in ("implicit", "hybrid"):
             try:
                 anime_id = self._resolve_anime_id(anime_identifier)
                 if anime_id:
                     recs = self.implicit_model.get_similar_items(
                         anime_id, top_k=top_k * 3
                     )
-                    w = self.weights["implicit"]
+                    w = self.weights["implicit"] if method == "hybrid" else 1.0
                     for rec in recs:
                         scores.setdefault(rec["mal_id"], {})["implicit"] = w * rec.get(
                             "similarity", 0
