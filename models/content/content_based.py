@@ -364,8 +364,10 @@ class ContentBasedRecommender:
                 if anime_id is None or anime_id in exclude_set:
                     continue
                 row = self.anime_df.iloc[i]
-                # cosine sim [-1,1] → [0,1] để scale với models khác
-                sim = float(np.clip((float(score) + 1.0) / 2.0, 0.0, 1.0))
+                # Embeddings đã L2-normalize → IP = cosine ∈ [-1,1]
+                # Dùng raw cosine clip ≥ 0 (nhất quán với get_similar_anime)
+                # Tránh (cosine+1)/2 làm thu hẹp phân biệt về [0.5, 1.0]
+                sim = float(max(float(score), 0.0))
                 results.append(
                     {
                         "mal_id": anime_id,
@@ -379,8 +381,17 @@ class ContentBasedRecommender:
         else:
             # Numpy fallback
             sims = self.embeddings @ user_vec
-            sims = np.clip((sims + 1.0) / 2.0, 0.0, 1.0)
+            # Raw cosine clip ≥ 0 — dùng -1 làm sentinel cho excluded items
+            # (sentinel phân biệt được vì valid sims luôn ≥ 0)
+            if exclude_set:
+                for aid in exclude_set:
+                    idx = self._id_to_idx.get(aid)
+                    if idx is not None:
+                        sims[idx] = -1.0  # sentinel trước khi clip
 
+            sims = np.maximum(sims, 0.0)
+
+            # Khôi phục sentinel cho excluded items (bị clip về 0 ở trên)
             if exclude_set:
                 for aid in exclude_set:
                     idx = self._id_to_idx.get(aid)
@@ -393,7 +404,7 @@ class ContentBasedRecommender:
 
             results = []
             for i in top_indices:
-                if sims[i] < 0:
+                if sims[i] < 0:  # skip sentinel (excluded) items
                     continue
                 anime_id = self._idx_to_id.get(int(i))
                 if anime_id is None or anime_id in exclude_set:
@@ -442,26 +453,58 @@ class ContentBasedRecommender:
             return []
 
         q = query.lower()
-        mask = self.anime_df["Name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+        mask = (
+            self.anime_df["Name"]
+            .astype(str)
+            .str.lower()
+            .str.contains(q, na=False, regex=False)
+        )
 
         # Thêm English name nếu có
         if "English name" in self.anime_df.columns:
-            mask |= self.anime_df["English name"].astype(str).str.lower().str.contains(q, na=False, regex=False)
+            mask |= (
+                self.anime_df["English name"]
+                .astype(str)
+                .str.lower()
+                .str.contains(q, na=False, regex=False)
+            )
 
         matches = self.anime_df[mask].head(top_k)
 
         results = []
         for i, row in matches.iterrows():
-            results.append({
-                "mal_id": int(row["MAL_ID"]),
-                "name": str(row["Name"]),
-                "score": self._score_cache.get(i, 0.0),
-                "genres": str(row["Genres"]) if "Genres" in row and pd.notna(row.get("Genres")) else None,
-                "type": str(row["Type"]) if "Type" in row and pd.notna(row.get("Type")) else None,
-                "episodes": int(row["Episodes"]) if "Episodes" in row and str(row.get("Episodes", "")).isdigit() else None,
-                "synopsis": str(row["Synopsis"]) if "Synopsis" in row and pd.notna(row.get("Synopsis")) else None,
-                "english_name": str(row["English name"]) if "English name" in row and pd.notna(row.get("English name")) else None,
-            })
+            results.append(
+                {
+                    "mal_id": int(row["MAL_ID"]),
+                    "name": str(row["Name"]),
+                    "score": self._score_cache.get(i, 0.0),
+                    "genres": (
+                        str(row["Genres"])
+                        if "Genres" in row and pd.notna(row.get("Genres"))
+                        else None
+                    ),
+                    "type": (
+                        str(row["Type"])
+                        if "Type" in row and pd.notna(row.get("Type"))
+                        else None
+                    ),
+                    "episodes": (
+                        int(row["Episodes"])
+                        if "Episodes" in row and str(row.get("Episodes", "")).isdigit()
+                        else None
+                    ),
+                    "synopsis": (
+                        str(row["Synopsis"])
+                        if "Synopsis" in row and pd.notna(row.get("Synopsis"))
+                        else None
+                    ),
+                    "english_name": (
+                        str(row["English name"])
+                        if "English name" in row and pd.notna(row.get("English name"))
+                        else None
+                    ),
+                }
+            )
         return results
 
     def _get_idx(self, identifier):
@@ -509,9 +552,9 @@ class ContentBasedRecommender:
         # Tương thích pkl cũ: map tên attribute cũ → mới
         _compat_map = {
             "sbert_embeddings": "embeddings",
-            "id_to_idx":        "_id_to_idx",
-            "idx_to_id":        "_idx_to_id",
-            "name_to_idx":      "_name_to_idx",
+            "id_to_idx": "_id_to_idx",
+            "idx_to_id": "_idx_to_id",
+            "name_to_idx": "_name_to_idx",
         }
         migrated = []
         for old_key, new_key in _compat_map.items():
@@ -539,5 +582,7 @@ class ContentBasedRecommender:
         # Rebuild FAISS từ embeddings đã load — không cần train lại
         self._build_faiss_index()
 
-        logger.info(f"ContentBasedRecommender ready | {len(self._id_to_idx)} anime indexed | embeddings={emb_shape}")
+        logger.info(
+            f"ContentBasedRecommender ready | {len(self._id_to_idx)} anime indexed | embeddings={emb_shape}"
+        )
         return self

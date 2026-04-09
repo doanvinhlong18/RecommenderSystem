@@ -230,6 +230,9 @@ class LearnedHybridEngine:
         self.collaborative_model = collaborative_model
         self.implicit_model = implicit_model
         self.popularity_model = popularity_model
+        # Item-Based CF model — dùng riêng cho recommend_similar_anime cascade
+        # Load từ item_based_cf.pkl nếu có, fallback về collaborative_model
+        self.item_cf_model = None
 
         self.relevance_threshold = relevance_threshold
         self.n_negatives_per_positive = n_negatives_per_positive
@@ -326,15 +329,21 @@ class LearnedHybridEngine:
             grouped = chunk.groupby("anime_id")["rating"].agg(["sum", "count"])
             for anime_id, row in grouped.iterrows():
                 anime_id = int(anime_id)
-                rating_sums[anime_id] = rating_sums.get(anime_id, 0.0) + float(row["sum"])
-                rating_counts[anime_id] = rating_counts.get(anime_id, 0) + int(row["count"])
+                rating_sums[anime_id] = rating_sums.get(anime_id, 0.0) + float(
+                    row["sum"]
+                )
+                rating_counts[anime_id] = rating_counts.get(anime_id, 0) + int(
+                    row["count"]
+                )
 
             if chunk_idx % 20 == 0:
                 logger.info("  Aggregated item stats for %d chunks...", chunk_idx)
 
         for anime_id, count in rating_counts.items():
             self._item_num_ratings[anime_id] = int(count)
-            self._item_avg_score[anime_id] = float(rating_sums[anime_id] / count) if count else 0.0
+            self._item_avg_score[anime_id] = (
+                float(rating_sums[anime_id] / count) if count else 0.0
+            )
 
         logger.info(f"Item stats loaded from CSV: {len(rating_counts)} anime")
 
@@ -384,7 +393,11 @@ class LearnedHybridEngine:
     def _collab_scores(self, user_id: int, aids: List[int]) -> Dict[int, float]:
         """
         Collaborative scores — gọi recommend_for_user một lần, map lên aids.
-        Cap top_k ở max(200, len(aids)) để tránh request quá lớn.
+
+        Normalize theo loại model:
+          BPR  → score field là raw dot product (unbounded) → sigmoid → [0,1]
+          SVD  → predicted_rating ∈ [1,10] → linear (r-1)/9 → [0,1]
+        sigmoid([1,10]) = [0.731, 0.9999] — quá bẹt, tín hiệu CF gần như bằng hằng số.
         """
         out = {a: 0.0 for a in aids}
         if not self.collaborative_model:
@@ -394,9 +407,14 @@ class LearnedHybridEngine:
             recs = self.collaborative_model.recommend_for_user(
                 user_id, top_k=fetch_k, exclude_rated=False
             )
+            _is_bpr = getattr(self.collaborative_model, "method", "bpr") == "bpr"
             for r in recs:
-                raw = r.get("score", r.get("predicted_rating", 5.0))
-                norm = float(1.0 / (1.0 + np.exp(-np.clip(float(raw), -20, 20))))
+                if _is_bpr:
+                    raw = r.get("score", 0.0)
+                    norm = float(1.0 / (1.0 + np.exp(-np.clip(float(raw), -20, 20))))
+                else:
+                    raw = r.get("predicted_rating", r.get("score", 5.0))
+                    norm = float(np.clip((float(raw) - 1.0) / 9.0, 0.0, 1.0))
                 out[r["mal_id"]] = norm
         except Exception as e:
             logger.debug(f"collab_scores error: {e}")
@@ -674,75 +692,115 @@ class LearnedHybridEngine:
         """
         Anime-to-anime recommendation — cascade 4 stages.
 
-        Stage 1 — Content retrieval (FAISS, ~0.4ms):
-            top_k*5 anime có embedding gần nhất với query anime.
+        Stage 1 — FAISS Content retrieval (~0.4ms):
+            Lấy max(top_k*5, 50) anime có embedding gần nhất với query.
+            Đây là "pool" chứa các ứng viên có content similarity cao.
 
-        Stage 2 — ALS + Collab expand (~1ms):
-            Lấy ALS item similarity và CF item similarity với query anime.
-            Union tất cả → ~80-120 candidates.
-            Anime xuất hiện ở nhiều model được boost score.
+        Stage 2 — ItemBased CF re-ranking:
+            Dùng item_cf_model (ItemBasedCF) nếu có, fallback ALS implicit,
+            fallback MatrixFactorization để lấy CF item similarity giữa query
+            và từng anime trong pool.
+            → Chỉ anime vừa similar về content VÀ được CF confirm mới có score cao.
+            Cách này đúng với yêu cầu: "FAISS lấy ~50 → CF lọc còn top_k".
 
         Stage 3 — Weighted score combination:
-            Dùng fallback_weights để kết hợp content/ALS/collab similarity.
-            Meta-model KHÔNG áp dụng ở đây vì cần user context.
+            combined = w_content * content_sim + w_cf * cf_sim + w_als * als_sim
+            Boost x1.15 mỗi source thêm (confidence: xuất hiện ở nhiều model).
 
         Stage 4 — Genre MMR:
             Đảm bảo kết quả đa dạng thể loại.
+
+        Parameters
+        ----------
+        anime_identifier : anime ID (int) hoặc tên (str)
+        top_k            : số kết quả cuối
+        method           : "hybrid" | "content" | "collaborative" | "implicit"
+        use_diversity    : dùng genre MMR
+
+        Notes
+        -----
+        item_cf_model ưu tiên: ItemBasedCF (user co-occurrence, loaded từ item_based_cf.pkl)
+        Fallback 1: implicit_model.get_similar_items() — ALS item factors
+        Fallback 2: collaborative_model.get_similar_items() — MF latent factors
         """
-        # ── Stage 1: Content FAISS retrieval ─────────────────────────
+        # ── Stage 1: FAISS Content retrieval ──────────────────────────────
         content_candidates: Dict[int, float] = {}
         if self.content_model and method in ("content", "hybrid"):
             try:
+                fetch_content = max(top_k * 5, 50)  # ít nhất 50 candidates
                 recs = self.content_model.get_similar_anime(
-                    anime_identifier, top_k=top_k * 5
+                    anime_identifier, top_k=fetch_content
                 )
                 for r in recs:
                     content_candidates[r["mal_id"]] = r["similarity"]
             except Exception as e:
                 logger.warning(f"Stage1 content error: {e}")
 
-        # ── Stage 2: ALS + Collab item similarity ────────────────────
-        als_candidates: Dict[int, float] = {}
-        collab_candidates: Dict[int, float] = {}
-        query_anime_id = self._resolve_anime_id(anime_identifier)
+        if method == "content":
+            # Pure content — không cần CF
+            all_candidates: Dict[int, Dict[str, float]] = {
+                aid: {"content": s} for aid, s in content_candidates.items()
+            }
+        else:
+            # ── Stage 2: CF item similarity re-ranking ──────────────────
+            query_anime_id = self._resolve_anime_id(anime_identifier)
+            cf_item_scores: Dict[int, float] = {}
+            als_scores: Dict[int, float] = {}
 
-        if self.implicit_model and method in ("implicit", "hybrid") and query_anime_id:
-            try:
-                recs = self.implicit_model.get_similar_items(
-                    query_anime_id, top_k=top_k * 3
+            if query_anime_id:
+                # Chọn CF model theo ưu tiên: ItemBasedCF > ALS > MF
+                # ItemBasedCF dùng user co-occurrence — đây là "item-based CF" thực sự
+                _cf_model = (
+                    self.item_cf_model  # ItemBasedCF nếu đã load
+                    or (
+                        # ALS implicit nếu chạy ở mode implicit/hybrid
+                        self.implicit_model
+                        if method in ("implicit", "hybrid")
+                        else None
+                    )
+                    or self.collaborative_model  # MF fallback cuối
                 )
-                for r in recs:
-                    als_candidates[r["mal_id"]] = r.get("similarity", 0.0)
-            except Exception as e:
-                logger.warning(f"Stage2 ALS error: {e}")
 
-        if (
-            self.collaborative_model
-            and method in ("collaborative", "hybrid")
-            and query_anime_id
-        ):
-            try:
-                recs = self.collaborative_model.get_similar_items(
-                    query_anime_id, top_k=top_k * 3
-                )
-                for r in recs:
-                    collab_candidates[r["mal_id"]] = r.get("similarity", 0.0)
-            except Exception as e:
-                logger.warning(f"Stage2 Collab error: {e}")
+                if _cf_model and method in ("collaborative", "hybrid", "implicit"):
+                    try:
+                        # Lấy đủ CF candidates để cover toàn bộ content pool
+                        fetch_cf = max(len(content_candidates) * 2, top_k * 5, 50)
+                        cf_recs = _cf_model.get_similar_items(
+                            query_anime_id, top_k=fetch_cf
+                        )
+                        for r in cf_recs:
+                            cf_item_scores[r["mal_id"]] = r.get("similarity", 0.0)
+                    except Exception as e:
+                        logger.warning(f"Stage2 CF item sim error: {e}")
 
-        # Union candidates, ghi nhận nguồn gốc
-        all_candidates: Dict[int, Dict[str, float]] = {}
-        for aid, s in content_candidates.items():
-            all_candidates.setdefault(aid, {})["content"] = s
-        for aid, s in als_candidates.items():
-            all_candidates.setdefault(aid, {})["implicit"] = s
-        for aid, s in collab_candidates.items():
-            all_candidates.setdefault(aid, {})["collaborative"] = s
+                # ALS bổ sung nếu _cf_model không phải implicit
+                if (
+                    self.implicit_model
+                    and _cf_model is not self.implicit_model
+                    and method in ("implicit", "hybrid")
+                ):
+                    try:
+                        fetch_als = max(top_k * 3, 30)
+                        for r in self.implicit_model.get_similar_items(
+                            query_anime_id, top_k=fetch_als
+                        ):
+                            als_scores[r["mal_id"]] = r.get("similarity", 0.0)
+                    except Exception as e:
+                        logger.warning(f"Stage2 ALS error: {e}")
+
+            # Union candidates — content là pool chính, CF/ALS cung cấp re-ranking signal
+            all_candidates = {}
+            for aid, s in content_candidates.items():
+                all_candidates.setdefault(aid, {})["content"] = s
+            for aid, s in cf_item_scores.items():
+                all_candidates.setdefault(aid, {})["collaborative"] = s
+            for aid, s in als_scores.items():
+                all_candidates.setdefault(aid, {})["implicit"] = s
 
         if not all_candidates:
             return []
 
-        # ── Stage 3: Weighted score combination ──────────────────────
+        # ── Stage 3: Weighted score combination ───────────────────────────
         w = self.fallback_weights
         aggregated = []
         for aid, sources in all_candidates.items():
@@ -752,13 +810,17 @@ class LearnedHybridEngine:
                     + w["collaborative"] * sources.get("collaborative", 0.0)
                     + w["implicit"] * sources.get("implicit", 0.0)
                 )
-                # Confidence boost: xuất hiện ở nhiều model → score cao hơn
+                # Confidence boost: xuất hiện nhiều model → độ tin cậy cao hơn
                 n_src = len(sources)
                 if n_src >= 2:
                     score *= 1.0 + 0.15 * (n_src - 1)
+            elif method == "collaborative":
+                score = sources.get("collaborative", 0.0)
+            elif method == "implicit":
+                score = sources.get("implicit", 0.0)
             else:
                 score = sources.get(method, 0.0)
-                
+
             if score > 0:
                 aggregated.append(
                     {
@@ -767,9 +829,10 @@ class LearnedHybridEngine:
                         "sources": list(sources.keys()),
                     }
                 )
+
         aggregated.sort(key=lambda x: -x["hybrid_score"])
 
-        # ── Stage 4: Enrich + Genre MMR ──────────────────────────────
+        # ── Stage 4: Enrich + Genre MMR ───────────────────────────────────
         enriched = []
         for item in aggregated[: top_k * 4]:
             rec = self._get_anime_info(item["mal_id"])
@@ -1216,6 +1279,25 @@ class LearnedHybridEngine:
                 self.collaborative_model = ItemBasedCF()
                 self.collaborative_model.load(directory / "collaborative_model.pkl")
 
+        # ItemBasedCF riêng cho recommend_similar_anime cascade
+        # Nếu có item_based_cf.pkl thì dùng, không thì fallback về implicit/collab
+        if (directory / "item_based_cf.pkl").exists():
+            try:
+                self.item_cf_model = ItemBasedCF()
+                self.item_cf_model.load(directory / "item_based_cf.pkl")
+                logger.info("ItemBasedCF loaded for similar-anime cascade")
+            except Exception as e:
+                logger.warning(
+                    f"item_based_cf.pkl load failed: {e} — will use ALS fallback"
+                )
+                self.item_cf_model = None
+        else:
+            self.item_cf_model = None
+            logger.info(
+                "item_based_cf.pkl not found — recommend_similar_anime sẽ dùng ALS/MF fallback. "
+                "Chạy train.py --stage collaborative để train ItemBasedCF."
+            )
+
         if (directory / "implicit_model.pkl").exists():
             self.implicit_model = ALSImplicit()
             self.implicit_model.load(directory / "implicit_model.pkl")
@@ -1383,7 +1465,9 @@ def _stream_selected_user_histories_from_csv(
     chunk_size: int = 500_000,
 ) -> Dict[int, Dict[int, float]]:
     """Load train histories only for the users selected for meta-model training."""
-    user_histories: Dict[int, Dict[int, float]] = {int(uid): {} for uid in selected_users}
+    user_histories: Dict[int, Dict[int, float]] = {
+        int(uid): {} for uid in selected_users
+    }
 
     if not user_histories:
         return user_histories
@@ -1440,7 +1524,9 @@ def train_learned_hybrid_from_csv(
         chunk_size=chunk_size,
     )
 
-    logger.info("Counting train interactions per user from %s...", train_ratings_csv_path)
+    logger.info(
+        "Counting train interactions per user from %s...", train_ratings_csv_path
+    )
     user_counts = _stream_user_rating_counts_from_csv(
         train_ratings_csv_path,
         chunk_size=chunk_size,
