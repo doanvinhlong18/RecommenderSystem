@@ -124,6 +124,58 @@ def train_content_model(
     return model
 
 
+def train_item_cf_model(
+    user_item_matrix,
+    anime_to_idx,
+    idx_to_anime,
+    user_to_idx,
+    idx_to_user,
+    implicit_model=None,
+) -> "ItemBasedCF":
+    """
+    Train ItemBasedCF cho recommend_similar_anime cascade.
+
+    ItemBasedCF dùng user co-occurrence similarity (không phải latent factors).
+    Đây là model được dùng ở Stage 2 của recommend_similar_anime:
+      FAISS content retrieval (top-50) → ItemBasedCF re-ranking → top-k
+
+    Không tính full item×item similarity matrix (17K² × 4 bytes = 1.2 GB) —
+    dùng on-demand cosine similarity khi query (an toàn về RAM).
+    Nếu implicit_model có item_factors (ALS 50-dim), build FAISS IndexFlatIP
+    trên đó để tăng tốc (~0.1ms/query vs ~50ms on-demand).
+
+    Parameters
+    ----------
+    user_item_matrix : csr_matrix (n_users, n_items) — explicit ratings
+    implicit_model   : ALSImplicit (optional) — cung cấp item_factors cho FAISS
+    """
+    logger.info("=" * 50)
+    logger.info("Training Item-Based CF Model (for similar-anime cascade)")
+    logger.info("=" * 50)
+
+    start_time = time.time()
+
+    item_factors = None
+    if implicit_model is not None and hasattr(implicit_model, "item_factors"):
+        item_factors = implicit_model.item_factors
+        logger.info("  Using ALS item_factors (%s) for FAISS index", item_factors.shape)
+
+    model = ItemBasedCF(k_neighbors=50)
+    model.fit(
+        user_item_matrix,
+        anime_to_idx,
+        idx_to_anime,
+        user_to_idx,
+        idx_to_user,
+        compute_full_similarity=False,  # on-demand — tránh 1.2 GB RAM
+        item_factors=item_factors,
+    )
+
+    elapsed = time.time() - start_time
+    logger.info(f"ItemBasedCF trained in {elapsed:.2f}s")
+    return model
+
+
 def train_collaborative_model(
     user_item_matrix,
     anime_to_idx,
@@ -167,13 +219,33 @@ def train_collaborative_model(
             device=device,
         )
 
+    # BPR yêu cầu implicit_matrix có cùng shape với user_item_matrix.
+    # implicit_matrix thường có nhiều items hơn (bao gồm anime implicit-only
+    # không đủ explicit ratings). Cần trim về đúng explicit item space.
+    bpr_implicit = implicit_matrix
+    if (
+        method == "bpr"
+        and implicit_matrix is not None
+        and implicit_matrix.shape != user_item_matrix.shape
+    ):
+        n_users, n_items = user_item_matrix.shape
+        n_imp_users, n_imp_items = implicit_matrix.shape
+        logger.info(
+            "Trimming implicit_matrix (%d x %d) to (%d x %d) for BPR",
+            n_imp_users,
+            n_imp_items,
+            n_users,
+            n_items,
+        )
+        bpr_implicit = implicit_matrix[:n_users, :n_items].tocsr()
+
     model.fit(
         user_item_matrix,
         anime_to_idx,
         idx_to_anime,
         user_to_idx,
         idx_to_user,
-        implicit_matrix=implicit_matrix,
+        implicit_matrix=bpr_implicit,
         implicit_model=implicit_model,
     )
 
@@ -272,7 +344,9 @@ def load_or_create_training_split(
         split_artifact = load_ratings_user_split(split_path)
         logger.info("Reusing persisted split: %s", split_path)
     else:
-        ratings_df = ratings_df if ratings_df is not None else loader.load_ratings(sample=False)
+        ratings_df = (
+            ratings_df if ratings_df is not None else loader.load_ratings(sample=False)
+        )
         split_artifact = create_ratings_user_split(
             ratings_df,
             min_train_items=min_train_items,
@@ -407,7 +481,9 @@ def run_quick_test(
 ):
     """Small post-train sanity check."""
     if learned_engine is None or matrix_builder is None or popularity_model is None:
-        logger.info("Skipping quick test because the required artifacts are not available")
+        logger.info(
+            "Skipping quick test because the required artifacts are not available"
+        )
         return
     if not matrix_builder.user_to_idx:
         logger.info("Skipping quick test because matrix mappings are empty")
@@ -519,6 +595,11 @@ def main():
         help="Bỏ qua bước train meta-model (tiết kiệm thời gian khi test)",
     )
     parser.add_argument(
+        "--skip-item-cf",
+        action="store_true",
+        help="Bỏ qua train ItemBasedCF (dùng ALS fallback cho similar-anime cascade)",
+    )
+    parser.add_argument(
         "--stage",
         type=str,
         default="all",
@@ -530,7 +611,9 @@ def main():
     total_start = time.time()
 
     if args.stage == "hybrid" and args.skip_learned_hybrid:
-        raise ValueError("--stage hybrid cannot be used together with --skip-learned-hybrid")
+        raise ValueError(
+            "--stage hybrid cannot be used together with --skip-learned-hybrid"
+        )
 
     # ===== INITIALIZE DEVICE =====
     logger.info("=" * 50)
@@ -554,7 +637,9 @@ def main():
         logger.info("Full-data mode enabled")
 
     train_base_stage = args.stage in {"all", "base"}
-    train_hybrid_stage = args.stage in {"all", "hybrid"} and not args.skip_learned_hybrid
+    train_hybrid_stage = (
+        args.stage in {"all", "hybrid"} and not args.skip_learned_hybrid
+    )
     save_dir = MODELS_DIR / "learned_hybrid"
     matrix_dir = MODELS_DIR / "matrices"
 
@@ -685,7 +770,9 @@ def main():
                         chunk_size=args.implicit_chunk_size,
                     )
             else:
-                logger.info("Skipping implicit matrix build (not needed by selected models)")
+                logger.info(
+                    "Skipping implicit matrix build (not needed by selected models)"
+                )
                 matrix_builder.implicit_matrix = None
 
             matrix_builder.save(matrix_dir)
@@ -706,8 +793,12 @@ def main():
             if not args.skip_implicit:
                 # Dùng implicit_anime_to_idx (superset của anime_to_idx) để implicit model
                 # bao gồm cả anime ít explicit rating như One Piece (đang phát sóng)
-                implicit_anime_to_idx = getattr(matrix_builder, "implicit_anime_to_idx", matrix_builder.anime_to_idx)
-                implicit_idx_to_anime = getattr(matrix_builder, "implicit_idx_to_anime", matrix_builder.idx_to_anime)
+                implicit_anime_to_idx = getattr(
+                    matrix_builder, "implicit_anime_to_idx", matrix_builder.anime_to_idx
+                )
+                implicit_idx_to_anime = getattr(
+                    matrix_builder, "implicit_idx_to_anime", matrix_builder.idx_to_anime
+                )
                 implicit_model = train_implicit_model(
                     matrix_builder.implicit_matrix,
                     implicit_anime_to_idx,
@@ -749,6 +840,24 @@ def main():
                     implicit_model=implicit_model,
                     reason="collaborative model",
                 )
+
+                # Train ItemBasedCF cho recommend_similar_anime cascade
+                # Lưu riêng thành item_based_cf.pkl (không qua engine.save())
+                if not args.skip_item_cf:
+                    item_cf_model = train_item_cf_model(
+                        matrix_builder.user_item_matrix,
+                        matrix_builder.anime_to_idx,
+                        matrix_builder.idx_to_anime,
+                        matrix_builder.user_to_idx,
+                        matrix_builder.idx_to_user,
+                        implicit_model=implicit_model,
+                    )
+                    item_cf_path = save_dir / "item_based_cf.pkl"
+                    item_cf_model.save(item_cf_path)
+                    logger.info("ItemBasedCF saved to %s", item_cf_path)
+                    clear_gpu_cache()
+                else:
+                    logger.info("Skipping ItemBasedCF (--skip-item-cf)")
             else:
                 logger.info("Skipping Collaborative Filtering")
 
@@ -892,7 +1001,9 @@ def main():
                     reason="interrupt",
                 )
         except Exception as checkpoint_error:
-            logger.exception("Failed to save checkpoint after interrupt: %s", checkpoint_error)
+            logger.exception(
+                "Failed to save checkpoint after interrupt: %s", checkpoint_error
+            )
         raise SystemExit(130)
 
 

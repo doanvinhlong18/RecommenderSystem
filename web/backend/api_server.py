@@ -143,7 +143,7 @@ def create_demo_app() -> FastAPI:
         """Load models on startup."""
         global hybrid_engine
 
-        model_path = MODELS_DIR / "hybrid"
+        model_path = MODELS_DIR / "learned_hybrid"
         if model_path.exists():
             try:
                 from models.hybrid import HybridEngine
@@ -383,7 +383,9 @@ def create_demo_app() -> FastAPI:
     async def recommend_similar_by_name(
         anime_name: str,
         top_k: int = Query(default=10, ge=1, le=50),
-        method: str = Query(default="hybrid", pattern="^(content|collaborative|implicit|hybrid)$"),
+        method: str = Query(
+            default="hybrid", pattern="^(content|collaborative|implicit|hybrid)$"
+        ),
     ):
         """
         Get anime recommendations similar to the specified anime name.
@@ -433,7 +435,9 @@ def create_demo_app() -> FastAPI:
     async def recommend_similar_by_id(
         anime_id: int,
         top_k: int = Query(default=10, ge=1, le=50),
-        method: str = Query(default="hybrid", pattern="^(content|collaborative|implicit|hybrid)$"),
+        method: str = Query(
+            default="hybrid", pattern="^(content|collaborative|implicit|hybrid)$"
+        ),
     ):
         """
         Get anime recommendations similar to the specified anime ID.
@@ -448,7 +452,10 @@ def create_demo_app() -> FastAPI:
         try:
             # Get query anime info (fallback to content model if not in _anime_info)
             query_anime = hybrid_engine._get_anime_info(anime_id)
-            if not query_anime or (query_anime.get("name", "").startswith(f"Anime {anime_id}") and not hybrid_engine._anime_info.get(anime_id)):
+            if not query_anime or (
+                query_anime.get("name", "").startswith(f"Anime {anime_id}")
+                and not hybrid_engine._anime_info.get(anime_id)
+            ):
                 raise HTTPException(
                     status_code=404, detail=f"Anime ID {anime_id} not found"
                 )
@@ -459,13 +466,17 @@ def create_demo_app() -> FastAPI:
             recommendations = hybrid_engine.recommend_similar_anime(
                 anime_id, top_k=top_k, method=method
             )
-            logger.info(f"recommend_similar_anime({anime_id}, method={method}) → {len(recommendations)} results")
+            logger.info(
+                f"recommend_similar_anime({anime_id}, method={method}) → {len(recommendations)} results"
+            )
 
             # Check content model index
             if len(recommendations) == 0 and method == "content":
                 cm = hybrid_engine.content_model
                 in_idx = cm is not None and anime_id in getattr(cm, "_id_to_idx", {})
-                logger.warning(f"  content_model._id_to_idx has id={anime_id}: {in_idx}, n_total={len(getattr(cm, '_id_to_idx', {}))}")
+                logger.warning(
+                    f"  content_model._id_to_idx has id={anime_id}: {in_idx}, n_total={len(getattr(cm, '_id_to_idx', {}))}"
+                )
                 if cm is not None:
                     sample = list(getattr(cm, "_id_to_idx", {}).keys())[:5]
                     logger.warning(f"  sample _id_to_idx keys: {sample}")
@@ -493,7 +504,9 @@ def create_demo_app() -> FastAPI:
         user_id: int,
         top_k: int = Query(default=10, ge=1, le=50),
         exclude_watched: bool = Query(default=True),
-        strategy: str = Query(default="auto", pattern="^(auto|new_user|existing_user)$"),
+        strategy: str = Query(
+            default="auto", pattern="^(auto|new_user|existing_user)$"
+        ),
     ):
         """
         Get personalized recommendations for a user.
@@ -562,7 +575,12 @@ def create_demo_app() -> FastAPI:
                     "count": 0,
                 }
         except Exception:
-            return {"user_id": user_id, "history": [], "is_known_user": False, "count": 0}
+            return {
+                "user_id": user_id,
+                "history": [],
+                "is_known_user": False,
+                "count": 0,
+            }
 
         # If the engine is ready, use its in-memory caches first.
         user_ratings = None
@@ -580,11 +598,18 @@ def create_demo_app() -> FastAPI:
         if not user_ratings and not user_watched:
             csv_items = _read_animelist_history_csv(user_id=user_id, top_k=top_k)
             if not csv_items:
-                return {"user_id": user_id, "history": [], "is_known_user": False, "count": 0}
+                return {
+                    "user_id": user_id,
+                    "history": [],
+                    "is_known_user": False,
+                    "count": 0,
+                }
 
             history = []
             for anime_id, rating, watching_status, watched_eps in csv_items:
-                implicit_score = (float(rating) / 10.0) if rating and rating > 0 else 0.5
+                implicit_score = (
+                    (float(rating) / 10.0) if rating and rating > 0 else 0.5
+                )
 
                 # If model isn't loaded, return minimal info.
                 if hybrid_engine is None:
@@ -601,7 +626,9 @@ def create_demo_app() -> FastAPI:
                     anime_info = hybrid_engine._get_anime_info(int(anime_id))
 
                 anime_info["implicit_score"] = round(float(implicit_score), 4)
-                anime_info["status_label"] = _watching_status_label(int(watching_status))
+                anime_info["status_label"] = _watching_status_label(
+                    int(watching_status)
+                )
                 anime_info["watched_episodes"] = (
                     int(watched_eps) if watched_eps and watched_eps > 0 else 0
                 )
@@ -621,10 +648,14 @@ def create_demo_app() -> FastAPI:
             return {"user_id": user_id, "history": [], "is_known_user": False}
 
         try:
+
             def _status_label(s: float) -> str:
-                if s >= 0.55: return "Completed"
-                if s >= 0.35: return "Watching"
-                if s >= 0.15: return "On-hold"
+                if s >= 0.55:
+                    return "Completed"
+                if s >= 0.35:
+                    return "Watching"
+                if s >= 0.15:
+                    return "On-hold"
                 return "Dropped"
 
             history = []
@@ -698,11 +729,23 @@ def create_demo_app() -> FastAPI:
 
             # Pick early/middle IDs to increase chance they exist in auxiliary maps.
             u1 = all_user_ids[0]
-            u2 = all_user_ids[len(all_user_ids) // 2] if len(all_user_ids) > 1 else all_user_ids[0]
+            u2 = (
+                all_user_ids[len(all_user_ids) // 2]
+                if len(all_user_ids) > 1
+                else all_user_ids[0]
+            )
 
             quick_users = [
-                {"user_id": int(u1), "label": f"Demo (#{int(u1)})", "description": "Existing user"},
-                {"user_id": int(u2), "label": f"Demo (#{int(u2)})", "description": "Existing user"},
+                {
+                    "user_id": int(u1),
+                    "label": f"Demo (#{int(u1)})",
+                    "description": "Existing user",
+                },
+                {
+                    "user_id": int(u2),
+                    "label": f"Demo (#{int(u2)})",
+                    "description": "Existing user",
+                },
                 {
                     "user_id": 999999,
                     "label": "New User",
@@ -974,7 +1017,9 @@ def create_demo_app() -> FastAPI:
                             if merged.get("similarity") is not None:
                                 merged["hybrid_score"] = float(merged["similarity"])
                             elif merged.get("predicted_rating") is not None:
-                                merged["hybrid_score"] = float(merged["predicted_rating"])
+                                merged["hybrid_score"] = float(
+                                    merged["predicted_rating"]
+                                )
                             else:
                                 merged["hybrid_score"] = 0.0
 
